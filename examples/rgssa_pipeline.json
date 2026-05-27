@@ -1,0 +1,164 @@
+{
+  "name": "RGSSA Map Enrichment Pipeline",
+  "description": "Upload CSV → Normalize → Score → Split (4 tiers) → AI Enrich → Merge → B-L Match → LCSH → Excel",
+  "nodes": [
+    {
+      "id": "n-csv",
+      "type": "input_csv",
+      "position": {"x": 50, "y": 300},
+      "data": {"label": "CSV Input", "config": {"encoding": "utf-8-sig", "delimiter": ","}}
+    },
+    {
+      "id": "n-normalize",
+      "type": "transform_normalize",
+      "position": {"x": 300, "y": 300},
+      "data": {
+        "label": "Normalize Fields",
+        "config": {
+          "operations": [
+            {"column": "Date Published ", "output_column": "date_year", "function": "date"},
+            {"column": "Scale", "output_column": "scale_clean", "function": "scale"},
+            {"column": "TITLE", "output_column": "title_clean", "function": "trim"},
+            {"column": "Call Number", "output_column": "bl_parsed", "function": "call_number"}
+          ]
+        }
+      }
+    },
+    {
+      "id": "n-score",
+      "type": "transform_formula",
+      "position": {"x": 550, "y": 300},
+      "data": {
+        "label": "Completeness Score",
+        "config": {
+          "output_column": "completeness",
+          "formula_type": "expression",
+          "formula": "count_filled([TITLE],[Author],[Date Published ],[Publisher],[Scale],[Subject],[Description ],[Call Number],[Format],[Place of Publication]) / 10 * 100"
+        }
+      }
+    },
+    {
+      "id": "n-split",
+      "type": "transform_split",
+      "position": {"x": 800, "y": 200},
+      "data": {
+        "label": "Tier Split",
+        "config": {
+          "rules": [
+            {
+              "output": "route_1", "label": "Tier A: Rules Only",
+              "conditions": [
+                {"column": "Listed on current Catalogue", "op": "equals", "value": "LISTED on Catalogue"},
+                {"column": "completeness", "op": ">=", "value": "70"}
+              ]
+            },
+            {
+              "output": "route_2", "label": "Tier B: Series (Sonnet)",
+              "conditions": [{"column": "Series (if known)", "op": "is_not_empty", "value": ""}]
+            },
+            {
+              "output": "route_3", "label": "Tier C: Haiku",
+              "conditions": [{"column": "completeness", "op": ">=", "value": "40"}]
+            },
+            {
+              "output": "route_4", "label": "Tier D: Sonnet Full",
+              "conditions": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "n-ai-c",
+      "type": "ai_enrich",
+      "position": {"x": 1100, "y": 300},
+      "data": {
+        "label": "AI: Tier C (Haiku)",
+        "config": {
+          "model": "claude-haiku-4-5-20251001",
+          "system_prompt": "Extract geographic info from map titles. JSON only, no markdown.",
+          "user_prompt_template": "Title: {TITLE}\nJSON: {\"continent\":\"\",\"country\":\"\",\"state\":\"\",\"city\":\"\",\"theme\":\"\"}",
+          "json_field_mapping": {"continent":"geo_continent","country":"geo_country","state":"geo_state","city":"geo_city","theme":"primary_theme"},
+          "max_tokens": 150,
+          "batch_mode": true
+        }
+      }
+    },
+    {
+      "id": "n-ai-d",
+      "type": "ai_enrich",
+      "position": {"x": 1100, "y": 500},
+      "data": {
+        "label": "AI: Tier D (Sonnet)",
+        "config": {
+          "model": "claude-sonnet-4-20250514",
+          "system_prompt": "Extract geographic info from map titles. JSON only, no markdown.",
+          "user_prompt_template": "Title: {TITLE}\nPublisher: {Publisher} | Date: {Date Published }\nJSON: {\"continent\":\"\",\"country\":\"\",\"state\":\"\",\"county\":\"\",\"city\":\"\",\"feature\":\"\",\"series\":\"\",\"sheet_no\":\"\",\"sheet_name\":\"\",\"theme\":\"\",\"lat\":0,\"lon\":0}",
+          "json_field_mapping": {"continent":"geo_continent","country":"geo_country","state":"geo_state","county":"geo_county","city":"geo_city","feature":"geo_feature","series":"map_series","sheet_no":"sheet_number","sheet_name":"sheet_name","theme":"primary_theme","lat":"approx_lat","lon":"approx_lon"},
+          "max_tokens": 300,
+          "batch_mode": true
+        }
+      }
+    },
+    {
+      "id": "n-merge",
+      "type": "transform_merge",
+      "position": {"x": 1400, "y": 350},
+      "data": {"label": "Merge Tiers", "config": {"how": "outer"}}
+    },
+    {
+      "id": "n-bl",
+      "type": "lookup_bl_area",
+      "position": {"x": 1650, "y": 350},
+      "data": {
+        "label": "B-L Area Match",
+        "config": {
+          "geo_columns": "geo_city,geo_feature,geo_state,geo_country,geo_continent",
+          "output_column": "bl_area_matched",
+          "min_match_length": 5
+        }
+      }
+    },
+    {
+      "id": "n-lcsh",
+      "type": "lookup_lcsh",
+      "position": {"x": 1900, "y": 350},
+      "data": {
+        "label": "LCSH Generator",
+        "config": {
+          "country_col": "geo_country",
+          "state_col": "geo_state",
+          "city_col": "geo_city",
+          "theme_col": "primary_theme",
+          "output_column": "subject_lcsh"
+        }
+      }
+    },
+    {
+      "id": "n-output",
+      "type": "output_xlsx",
+      "position": {"x": 2150, "y": 350},
+      "data": {
+        "label": "Excel Output",
+        "config": {
+          "filename": "rgssa_enriched.xlsx",
+          "sheet_name": "Enriched",
+          "freeze_top_row": true,
+          "auto_filter": true
+        }
+      }
+    }
+  ],
+  "edges": [
+    {"id": "e1", "source": "n-csv", "sourceHandle": "output", "target": "n-normalize", "targetHandle": "input"},
+    {"id": "e2", "source": "n-normalize", "sourceHandle": "output", "target": "n-score", "targetHandle": "input"},
+    {"id": "e3", "source": "n-score", "sourceHandle": "output", "target": "n-split", "targetHandle": "input"},
+    {"id": "e4", "source": "n-split", "sourceHandle": "route_3", "target": "n-ai-c", "targetHandle": "input"},
+    {"id": "e5", "source": "n-split", "sourceHandle": "route_4", "target": "n-ai-d", "targetHandle": "input"},
+    {"id": "e6", "source": "n-ai-c", "sourceHandle": "output", "target": "n-merge", "targetHandle": "left"},
+    {"id": "e7", "source": "n-ai-d", "sourceHandle": "output", "target": "n-merge", "targetHandle": "right"},
+    {"id": "e8", "source": "n-merge", "sourceHandle": "output", "target": "n-bl", "targetHandle": "input"},
+    {"id": "e9", "source": "n-bl", "sourceHandle": "output", "target": "n-lcsh", "targetHandle": "input"},
+    {"id": "e10", "source": "n-lcsh", "sourceHandle": "output", "target": "n-output", "targetHandle": "input"}
+  ]
+}

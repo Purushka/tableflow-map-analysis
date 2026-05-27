@@ -1,0 +1,44 @@
+[
+  {
+    "id": "ll_incomp",
+    "title": "Incomplete scan detection",
+    "phases": ["L1", "Synthesis"],
+    "category": "lessons_learned",
+    "content": "If the image aspect ratio doesn't match the filename dimensions (e.g. filename says 91x91cm but the image is roughly 91x45cm or 2:1 wide), the scan likely contains only PART of the original map. Describe ONLY what is visible in this scan. Do NOT use external knowledge of what the full map contains. Place names, regions, or coordinate ranges that are NOT visible in this scan must NOT appear in the output, even if you know they belong to the original map."
+  },
+  {
+    "id": "ll_inset",
+    "title": "Inset map definition",
+    "phases": ["L1", "Synthesis"],
+    "category": "lessons_learned",
+    "content": "An inset map is a SEPARATE smaller map drawn within its own border, depicting a different area or scale than the main map. A place name labelled on the main map is NOT an inset, even if that place is far from the centre or in another country. Only count something as an inset if you can see a distinct rectangular border enclosing a separately-drawn map."
+  },
+  {
+    "id": "ll_proper_nouns",
+    "title": "No external knowledge for proper nouns",
+    "phases": ["L1", "Synthesis"],
+    "category": "lessons_learned",
+    "content": "Never add author initials, surnames, dates, titles, or biographical info for cartographers/surveyors/publishers that you know from external sources. If only 'Goyder' is visible on the map, write 'Goyder' — do NOT expand to 'G.W. Goyder' or 'Surveyor-General Goyder'. If only 'Luebbers' is visible, do NOT add 'R.A.' even if you know who R.A. Luebbers is. Names, dates, and editions must come from text printed on THIS scan."
+  },
+  {
+    "id": "ll_ocr_confusions",
+    "title": "Similar character vigilance",
+    "phases": ["L1", "L2a", "L3_sample", "Synthesis"],
+    "category": "lessons_learned",
+    "content": "Common OCR confusions on historical maps that frequently cause errors: N\u2194S in compass and grid letters (e.g. 'N.G.F.' vs 'S.G.F.'); 'time correction' \u2194 'fine correction'; 'convergence' \u2194 'contours converge'; handwritten 13\u219412, 8\u21943, 6\u21940; missing decimal points in handwritten reference numbers (e.g. 834.2 read as 8342). When uncertain about a single character that changes meaning, mark the field for supplement crop with a tight bbox around the ambiguous text."
+  },
+  {
+    "id": "ll_bbox_grounding",
+    "title": "Bbox must derive from visible coordinates",
+    "phases": ["L1", "L3_coord", "Synthesis"],
+    "category": "lessons_learned",
+    "content": "bbox_west / bbox_east / bbox_south / bbox_north values MUST come from coordinate text PRINTED on this scan: degree marks along the borders, grid labels, or numbered tick marks. Do NOT estimate the bbox from your knowledge of where a region lies on Earth. If no coordinate text is visible on this scan, write '' (empty string) for all four bbox fields. A scan that shows only half a map will have a smaller bbox than the full map — do not extrapolate."
+  },
+  {
+    "id": "ll_celestial",
+    "title": "Celestial coords are not geographic",
+    "phases": ["L1", "Synthesis"],
+    "category": "lessons_learned",
+    "content": "For celestial / star / constellation maps that depict the sky rather than the Earth: bbox_west, bbox_east, bbox_south, bbox_north, scale_ratio, scale_text, and coordinates_text MUST all be 'N/A'. Right ascension and declination ranges belong in type_specific.right_ascension_range and type_specific.declination_range, NOT in geographic bbox fields. Do NOT fill bbox with -180/180/-90/90 just because the chart covers the whole sky."
+  }
+]

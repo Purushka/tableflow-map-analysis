@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.log
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Claude Code local config
+.claude/
+
+# Env files (keep .env.example)
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+
+# Backend storage (runtime data, user uploads, generated outputs)
+backend/storage/tableflow.db
+backend/storage/tableflow.db-journal
+backend/storage/uploads/
+backend/storage/outputs/
+backend/storage/map_previews/
+backend/storage/map_debug/
+backend/storage/fewshot/
+backend/storage/temp_preview/
+
+# Session notes / scratch
+SESSION_HANDOFF.md
+test_match_review.py
+NUL
