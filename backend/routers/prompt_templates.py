@@ -4,11 +4,13 @@ Prompt template management API.
 Allows reading, editing, and resetting the AI prompt templates used by
 the map analysis pipeline, without touching code.
 
-The current pipeline uses three templates:
-  EXTRACT_SYSTEM / EXTRACT_USER  — grounded extractor (single pass)
-  CRITIC_SYSTEM / CRITIC_USER    — independent grounding verifier
-  CORRECTION_USER                — fed back to the extractor's session
-                                   when the critic flags something
+The current pipeline uses these templates:
+  EXTRACT_SYSTEM / EXTRACT_USER       — grounded extractor (single pass)
+  GEO_CRITIC_SYSTEM / *_USER          — strict geographic-claim verifier
+  OCR_CRITIC_SYSTEM / *_USER          — medium text-fidelity verifier
+  VISUAL_CRITIC_SYSTEM / *_USER       — lenient visual-classification verifier
+  CORRECTION_USER                     — fed back to the extractor's session
+                                        when a critic flags something
 """
 
 import os
@@ -41,18 +43,46 @@ TEMPLATE_META = {
         "description": "User prompt that tells the extractor what fields to ground and how.",
         "placeholders": ["{filename}"],
     },
-    "CRITIC_SYSTEM": {
+    "GEO_CRITIC_SYSTEM": {
         "level": "Critic",
         "role": "system",
-        "label": "Critic System — Grounding Verifier",
-        "description": "System instructions for the independent grounding verifier.",
+        "label": "Geo Critic System — Strict Anti-Hallucination",
+        "description": "System rules for the geographic-claim verifier (country/province/city/bbox).",
         "placeholders": [],
     },
-    "CRITIC_USER": {
+    "GEO_CRITIC_USER": {
         "level": "Critic",
         "role": "user",
-        "label": "Critic User — Per-Field Verdicts",
-        "description": "User prompt for the critic to verify each grounded claim.",
+        "label": "Geo Critic User — Geographic Claims Audit",
+        "description": "User prompt for the geographic-claim verifier.",
+        "placeholders": ["{filename}", "{claims_json}"],
+    },
+    "OCR_CRITIC_SYSTEM": {
+        "level": "Critic",
+        "role": "system",
+        "label": "OCR Critic System — Text Fidelity",
+        "description": "System rules for the OCR/text-fidelity verifier (title/date/publisher/scale/etc).",
+        "placeholders": [],
+    },
+    "OCR_CRITIC_USER": {
+        "level": "Critic",
+        "role": "user",
+        "label": "OCR Critic User — Text Claims Audit",
+        "description": "User prompt for the OCR/text-fidelity verifier.",
+        "placeholders": ["{filename}", "{claims_json}"],
+    },
+    "VISUAL_CRITIC_SYSTEM": {
+        "level": "Critic",
+        "role": "system",
+        "label": "Visual Critic System — Lenient Classification",
+        "description": "System rules for the visual-classification verifier (map_type/medium/condition/etc).",
+        "placeholders": [],
+    },
+    "VISUAL_CRITIC_USER": {
+        "level": "Critic",
+        "role": "user",
+        "label": "Visual Critic User — Visual Claims Audit",
+        "description": "User prompt for the visual-classification verifier.",
         "placeholders": ["{filename}", "{claims_json}"],
     },
     "CORRECTION_USER": {
@@ -87,14 +117,20 @@ def _get_defaults() -> dict[str, str]:
     """Import and return default prompt constants from ai_map_analysis."""
     from ..nodes.ai_map_analysis import (
         EXTRACT_SYSTEM, EXTRACT_USER,
-        CRITIC_SYSTEM, CRITIC_USER,
+        GEO_CRITIC_SYSTEM, GEO_CRITIC_USER,
+        OCR_CRITIC_SYSTEM, OCR_CRITIC_USER,
+        VISUAL_CRITIC_SYSTEM, VISUAL_CRITIC_USER,
         CORRECTION_USER,
     )
     return {
         "EXTRACT_SYSTEM": EXTRACT_SYSTEM,
         "EXTRACT_USER": EXTRACT_USER,
-        "CRITIC_SYSTEM": CRITIC_SYSTEM,
-        "CRITIC_USER": CRITIC_USER,
+        "GEO_CRITIC_SYSTEM": GEO_CRITIC_SYSTEM,
+        "GEO_CRITIC_USER": GEO_CRITIC_USER,
+        "OCR_CRITIC_SYSTEM": OCR_CRITIC_SYSTEM,
+        "OCR_CRITIC_USER": OCR_CRITIC_USER,
+        "VISUAL_CRITIC_SYSTEM": VISUAL_CRITIC_SYSTEM,
+        "VISUAL_CRITIC_USER": VISUAL_CRITIC_USER,
         "CORRECTION_USER": CORRECTION_USER,
     }
 

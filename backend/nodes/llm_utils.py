@@ -28,6 +28,8 @@ def extract_json(text: str) -> dict:
     # Remove trailing commas before } or ] (common LLM formatting issue)
     cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
 
+    decoder = json.JSONDecoder(strict=False)
+
     # Try parsing as-is first (strict=False to allow control chars in strings)
     try:
         parsed = json.loads(cleaned, strict=False)
@@ -49,10 +51,25 @@ def extract_json(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
+    # Handle "Extra data after JSON" (model returned multiple objects or
+    # garbage tail) by taking the FIRST complete JSON object.
+    try:
+        parsed, _ = decoder.raw_decode(json_str)
+        return _nulls_to_empty(parsed)
+    except json.JSONDecodeError:
+        pass
+
     # Attempt to repair truncated JSON
     repaired = _repair_truncated_json(json_str)
     try:
         parsed = json.loads(repaired, strict=False)
+        return _nulls_to_empty(parsed)
+    except json.JSONDecodeError:
+        pass
+
+    # Last-ditch: raw_decode on the repaired string
+    try:
+        parsed, _ = decoder.raw_decode(repaired)
         return _nulls_to_empty(parsed)
     except json.JSONDecodeError as e:
         raise ValueError(f"Cannot parse JSON even after repair: {e}. Raw: {cleaned[:300]}")

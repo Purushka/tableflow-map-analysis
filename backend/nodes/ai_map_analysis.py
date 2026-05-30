@@ -401,6 +401,58 @@ def _extract_dimensions_cm(filename: str) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+def _read_image_physical_info(image_path: str) -> dict:
+    """Read DPI + pixel dims from the image file and compute physical cm.
+
+    Returns: {pixel_w, pixel_h, dpi_x, dpi_y, image_w_cm, image_h_cm}.
+    Any field is 0 if not determinable.
+    """
+    from PIL import Image
+    out = {
+        "pixel_w": 0, "pixel_h": 0,
+        "dpi_x": 0.0, "dpi_y": 0.0,
+        "image_w_cm": 0.0, "image_h_cm": 0.0,
+    }
+    try:
+        with Image.open(image_path) as im:
+            out["pixel_w"], out["pixel_h"] = im.size
+            dpi = im.info.get("dpi")
+            if dpi and isinstance(dpi, (tuple, list)) and len(dpi) >= 2:
+                try:
+                    dx, dy = float(dpi[0]), float(dpi[1])
+                    if dx > 0 and dy > 0:
+                        out["dpi_x"] = round(dx, 1)
+                        out["dpi_y"] = round(dy, 1)
+                        # 1 inch = 2.54 cm
+                        out["image_w_cm"] = round(out["pixel_w"] / dx * 2.54, 2)
+                        out["image_h_cm"] = round(out["pixel_h"] / dy * 2.54, 2)
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+# Heuristic to classify the source of a scale_ratio claim.
+# This is applied to the evidence_text the extractor provides.
+def _classify_scale_source(evidence_text: str, evidence_kind: str) -> str:
+    """Return one of: printed_ratio, computed_from_text, computed_from_bar, unknown."""
+    if not evidence_text:
+        return "unknown"
+    if evidence_kind == "direct_quote":
+        # OCR'd directly from a printed ratio like "1:25000"
+        if re.search(r"\d[\d,]{2,}\s*$", evidence_text) or "1:" in evidence_text:
+            return "printed_ratio"
+        return "direct_quote_other"
+    if evidence_kind != "computed":
+        return "unknown"
+    et = evidence_text.lower()
+    # Bar-derived: "scale bar", "graphical scale", contains "→" with units
+    if "bar" in et or "graphical" in et or "mile" in et or "km" in et or "inch" in et:
+        return "computed_from_bar"
+    return "computed_from_text"
+
+
 # ── Institutional cataloguing prefix (appended to system prompts on retry) ──
 _CATALOGUE_PREFIX = """\
 IMPORTANT: This analysis is performed by an institutional archive (library / \
@@ -446,16 +498,72 @@ def _sanitize_bbox(bbox, label: str = "") -> list[float]:
     return [round(x, 2), round(y, 2), round(w, 2), round(h, 2)]
 
 
+# Transient errors we retry: network blips, 5xx, rate limits, upstream timeouts.
+# We DON'T retry on auth errors, content-policy refusals, geo-blocks etc.
+_TRANSIENT_MARKERS = (
+    "connection error", "connection reset", "connection aborted",
+    "timeout", "timed out", "deadline exceeded",
+    "503", "502", "504", "529",  # 529 = Anthropic overload
+    "rate limit", "rate-limit", "ratelimit",
+    "temporarily unavailable", "service unavailable",
+    "upstream", "bad gateway",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_MARKERS)
+
+
+async def _with_retry(coro_factory, *, max_attempts: int = 4,
+                      base_delay: float = 2.0, context=None, row_info=None,
+                      label: str = ""):
+    """Call coro_factory() up to max_attempts times on transient failures.
+
+    base_delay grows exponentially (2, 4, 8 sec ...). Non-transient exceptions
+    re-raise immediately.
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await coro_factory()
+        except GeminiRecitationError:
+            raise  # handled separately by the recitation wrapper
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts or not _is_transient(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            if context and row_info:
+                await context.emit("ai_debug", {
+                    **row_info,
+                    "phase": "transient_retry",
+                    "attempt": attempt,
+                    "next_delay_sec": delay,
+                    "label": label,
+                    "error": str(exc)[:300],
+                })
+            await asyncio.sleep(delay)
+    if last_exc:
+        raise last_exc
+
+
 async def _call_with_recitation_retry(
     model, system, user_text, image_b64, image_mime,
     max_tokens, api_key, context=None, row_info=None,
 ) -> LLMResponse:
-    """Call vision LLM; on Gemini recitation block, retry with catalogue prefix."""
-    try:
-        return await call_vision_llm(
-            model, system, user_text,
-            image_b64, image_mime, max_tokens, api_key,
+    """Call vision LLM with transient-error retry + Gemini recitation fallback."""
+    async def _attempt(sys_p):
+        return await _with_retry(
+            lambda: call_vision_llm(
+                model, sys_p, user_text,
+                image_b64, image_mime, max_tokens, api_key,
+            ),
+            context=context, row_info=row_info, label=f"call_vision[{model}]",
         )
+
+    try:
+        return await _attempt(system)
     except GeminiRecitationError:
         if context and row_info:
             await context.emit("ai_debug", {
@@ -463,21 +571,24 @@ async def _call_with_recitation_retry(
                 "phase": "error",
                 "error": "Gemini RECITATION block — retrying with catalogue framing...",
             })
-        retry_system = _CATALOGUE_PREFIX + "\n\n" + system
-        return await call_vision_llm(
-            model, retry_system, user_text,
-            image_b64, image_mime, max_tokens, api_key,
-        )
+        return await _attempt(_CATALOGUE_PREFIX + "\n\n" + system)
 
 
 async def _call_conversation_with_recitation_retry(
     model, system, messages, max_tokens, api_key, context=None, row_info=None,
 ) -> LLMResponse:
-    """Call vision conversation; on Gemini recitation block, retry with catalogue prefix."""
-    try:
-        return await call_vision_conversation(
-            model, system, messages, max_tokens, api_key,
+    """Call vision conversation with transient-error retry + Gemini recitation fallback."""
+    async def _attempt(sys_p):
+        return await _with_retry(
+            lambda: call_vision_conversation(
+                model, sys_p, messages, max_tokens, api_key,
+            ),
+            context=context, row_info=row_info,
+            label=f"call_vision_conv[{model}]",
         )
+
+    try:
+        return await _attempt(system)
     except GeminiRecitationError:
         if context and row_info:
             await context.emit("ai_debug", {
@@ -485,10 +596,7 @@ async def _call_conversation_with_recitation_retry(
                 "phase": "error",
                 "error": "Gemini RECITATION block — retrying with catalogue framing...",
             })
-        retry_system = _CATALOGUE_PREFIX + "\n\n" + system
-        return await call_vision_conversation(
-            model, retry_system, messages, max_tokens, api_key,
-        )
+        return await _attempt(_CATALOGUE_PREFIX + "\n\n" + system)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -595,6 +703,20 @@ in 0..100, origin top-left.
 Example: [10, 5, 30, 8] = 10% from left, 5% from top, 30% wide, 8% tall.
 Keep bboxes TIGHT around the evidence but with a 1-2% safety margin.
 
+BBOX TIGHTNESS RULE — DO NOT USE THE FULL-IMAGE BBOX
+[0, 0, 100, 100] (covering the entire image) is FORBIDDEN for any
+direct_quote or computed field. A title block, scale bar, coordinate
+strip, legend, etc. occupies a small fraction of the image — your
+evidence_bbox must reflect that. A typical text bbox is 5-40% wide,
+2-15% tall. A typical strip bbox is 80-100% wide but only 3-10% tall
+(or vice-versa). If you cannot locate the value within a small region,
+the value is probably not visible — OMIT the field instead.
+
+The only fields where a wide bbox is acceptable are visual_observation
+fields whose evidence really IS the whole image:
+  map_type, medium, condition, description, has_insets
+and even there, prefer the smallest region that demonstrates the trait.
+
 RULES
 - NEVER include a field whose value you cannot ground. If you cannot
   OCR / see / compute it, OMIT it.
@@ -602,6 +724,27 @@ RULES
   visible (not where the metadata belongs conceptually).
 - For "computed" fields, point the bbox at the SOURCE region (e.g. for
   scale_ratio computed from a scale bar, point at the scale bar).
+
+ANTI-HALLUCINATION HARD RULES — most-leaked fields
+- country / province / city / district: ONLY list a place name that
+  you can SEE PRINTED on the map (in the title, legend, or as a label
+  on the body). Do NOT infer the country from world knowledge of which
+  countries border the depicted region. Example: an Arctic map showing
+  "GREENLAND" and "SPITSBERGEN" labels lets you write country=
+  "Greenland, Norway"; it does NOT let you write "USA, Canada, Russia"
+  just because those countries also border the Arctic. If the scan
+  appears to be a partial / cropped view, only describe the visible
+  portion.
+- bbox_west / bbox_east / bbox_south / bbox_north: ONLY emit a value
+  for an edge if you can SEE a printed coordinate tick / label at that
+  edge in the visible image. Do NOT emit -180 / 180 unless those exact
+  values are printed and visible. Do NOT emit 90°N for a polar map
+  unless the scan shows the pole label. For partial-scan maps where
+  one or more edges are missing, EMIT ONLY THE EDGES WHERE LABELS ARE
+  VISIBLE and OMIT the others (leave them out entirely).
+- publisher: ONLY a name printed somewhere on the visible map (title
+  block, margin, or copyright line). Do NOT supply a publisher from
+  knowledge of which institution typically produces this kind of map.
 - For NON-GEOGRAPHIC maps (celestial, etc.), DO NOT produce bbox_west /
   bbox_east / bbox_south / bbox_north — omit them. Use type_specific
   for celestial coordinate info (right_ascension_range, declination_range,
@@ -617,51 +760,20 @@ RULES
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Grounding critic prompts
+# Specialist critic prompts — three domains, three calibrations
+#
+# Each specialist sees only the claims in its domain, with a strictness
+# tuned for that domain's failure modes:
+#   geo    — STRICT (training-knowledge leak is the main risk)
+#   ocr    — MEDIUM (catch character-level errors, tolerate paraphrase)
+#   visual — LENIENT (classification, paraphrase is fine)
 # ═════════════════════════════════════════════════════════════════════════════
 
-CRITIC_SYSTEM = """\
-You are an independent cartographic fact-checker. Another AI has extracted \
-metadata from a map and bound each field to a specific bounding box of the \
-image (the evidence_bbox). Your job: verify each grounded claim.
-
-For each field, look at the indicated evidence_bbox region in the image and \
-confirm whether the claimed value is actually supported by what is visible \
-there.
-
-- ok = true   the value is genuinely supported by what's in the bbox
-- ok = false  the value is NOT visible in the bbox, the bbox points to a
-              wrong area, the value is more specific than the region shows,
-              or the value appears to come from training knowledge of
-              similar maps rather than from this scan.
-
-You may NOT add new fields. You may NOT correct values. You may only flag.
-
-Return STRICT JSON only — no commentary."""
-
-CRITIC_USER = """\
-Audit the grounded metadata extracted from this map.
-
-Filename: {filename}
-
-═══ GROUNDED CLAIMS ═══
-{claims_json}
-
-═══ INSTRUCTIONS ═══
-For each field in the claims, look at its evidence_bbox region in the \
-attached image and judge:
-
-- "ok": true  if the value is clearly supported by what is visible in
-              the evidence_bbox. The evidence_text should match what is
-              actually readable / observable there.
-- "ok": false if any of:
-              * the value is NOT actually visible in that region
-              * the bbox points to the wrong area (wrong edge of the map,
-                wrong text block, etc.)
-              * the value is more specific than the region actually shows
-              * the value appears to come from training knowledge of
-                similar maps rather than from this scan
-
+# Shared JSON return shape & rules used by all three critics.
+# Braces in the JSON example are doubled because each *_USER template is
+# fed through .format(filename=..., claims_json=...) downstream; only
+# the {filename} / {claims_json} placeholders should expand.
+_CRITIC_RETURN_SHAPE = """\
 Return STRICT JSON:
 
 {{
@@ -673,19 +785,202 @@ Return STRICT JSON:
     }},
     "<other_field>": {{
       "ok": false,
-      "issue": "one sentence explaining what's wrong",
-      "what_you_see": "briefly describe what IS actually visible in that bbox"
+      "issue": "one sentence — what specifically is wrong",
+      "what_you_see": "what IS visible at/near the bbox"
     }}
   }}
 }}
 
 For "type_specific" entries, prefix the key with "type_specific." \
-(e.g. "type_specific.contour_interval").
-
-When ok=true, "issue" and "what_you_see" MUST be empty strings.
-When ok=false, BOTH "issue" and "what_you_see" are required.
-
+(e.g. "type_specific.contour_interval"). When ok=true, "issue" and \
+"what_you_see" MUST be empty. When ok=false, both are required. \
 Audit ONLY fields present in the input claims. Do NOT invent fields."""
+
+
+# ── GEO critic — strict, anti-hallucination ────────────────────────────────
+
+GEO_CRITIC_SYSTEM = """\
+You are a geographic-claim fact-checker for map metadata. You audit
+ONLY fields that name administrative regions or coordinate bounds:
+  country, province, city, district,
+  coordinates_text, bbox_west, bbox_east, bbox_south, bbox_north.
+
+Be STRICT. These fields are the most-leaked category — a model that
+"knows" what region a map depicts will list bordering countries and
+plausible coordinate ranges that aren't actually printed on the scan.
+Your job: catch every such leak.
+
+Verdict policy
+- ok = true   ONLY if the value has direct visible evidence on the map:
+              * Each named place (country/province/city/district) must
+                have a corresponding label PRINTED on the map (in the
+                title, legend, or as a place label).
+              * Each bbox_* edge must correspond to a coordinate tick
+                or label PRINTED at the visible edge.
+              * Saying "country=USA" requires a visible "USA" / "United
+                States" label or visible US territory with a name label
+                you can point to.
+- ok = false  if the value is plausible from world knowledge of which
+              countries border the depicted region but you cannot point
+              to a printed label on the scan.
+- ok = false  for partial / cropped scans where bbox edges have been
+              extrapolated to the full original map area.
+
+Synonym/abbreviation tolerance: "SA" → "South Australia", "U.S.A." →
+"USA" are still ok=true if any form is visible.
+
+You may NOT add fields. You may NOT correct values. You only flag.
+Return STRICT JSON only."""
+
+GEO_CRITIC_USER = """\
+Audit the GEOGRAPHIC claims for this map.
+
+Filename: {filename}
+
+═══ GEOGRAPHIC CLAIMS ═══
+{claims_json}
+
+For each field, look at the evidence_bbox region AND the broader image:
+- ok=true  ONLY if every named place has a visible label, OR every
+           bbox edge corresponds to a visible printed coordinate tick.
+- ok=false if any named place lacks a visible label, OR any bbox edge
+           extrapolates beyond what the scan actually shows.
+
+""" + _CRITIC_RETURN_SHAPE
+
+
+# ── OCR critic — medium strictness ─────────────────────────────────────────
+
+OCR_CRITIC_SYSTEM = """\
+You are an OCR-fidelity fact-checker for map metadata. You audit ONLY
+fields that quote or interpret PRINTED TEXT on the map:
+  title, date_text, date_year, publisher, scale_text, scale_ratio,
+  projection, edition, legend_content, notes, place_names.
+
+Verdict policy
+- ok = true   if the value matches the visible printed text closely.
+              You should ACCEPT:
+              * paraphrasing / summarization of long notes
+              * minor punctuation differences
+              * scale_ratio numerically within 2% of the printed value
+              * place_names that lists ANY 3-5 visible names
+              * date_year computed correctly from a visible date_text
+- ok = false  if there's a CHARACTER-LEVEL OCR error you can verify
+              against the bbox (e.g. value says "S.G.F" but image shows
+              "N.G.F"), OR a publisher / projection / edition that is
+              NOT printed anywhere on the visible map (training-knowledge
+              leak — common for famous map series).
+
+A loose bbox alone is not grounds to flag. If the value is visible
+SOMEWHERE on the map and basically matches, accept it.
+
+You may NOT add fields. You may NOT correct values. You only flag.
+Return STRICT JSON only."""
+
+OCR_CRITIC_USER = """\
+Audit the OCR/text claims for this map.
+
+Filename: {filename}
+
+═══ OCR/TEXT CLAIMS ═══
+{claims_json}
+
+For each field, compare the value to the printed text visible in the
+image (search the whole map, not just the bbox — bboxes may be loose):
+- ok=true  if the printed text supports the value (paraphrase OK).
+- ok=false ONLY for character-level mismatches you can verify, or for
+           publisher/projection/edition values that aren't printed
+           anywhere visible.
+
+""" + _CRITIC_RETURN_SHAPE
+
+
+# ── Visual critic — lenient ────────────────────────────────────────────────
+
+VISUAL_CRITIC_SYSTEM = """\
+You are a visual-classification fact-checker for map metadata. You
+audit ONLY fields about overall visual character:
+  map_type, medium, condition, coverage, subject, language,
+  has_insets, description.
+
+These are interpretive classifications — paraphrase, synonym, and
+slight abstraction are EXPECTED. Be LENIENT.
+
+Verdict policy
+- ok = true  whenever the value is a reasonable visual classification
+             of the map, even if you would have phrased it differently.
+             ACCEPT:
+             * synonyms ("monochrome" vs "black and white")
+             * different but compatible map_type assignments
+             * description paraphrases
+             * has_insets descriptions that name visible inset boxes
+- ok = false ONLY if the classification is clearly wrong:
+             * a topographic map labelled map_type="celestial"
+             * description mentioning features absent from the image
+             * has_insets="yes: X" where X is on the main map, not an inset
+             * language claim contradicting visible text
+
+When in doubt, ok=true.
+
+You may NOT add fields. You may NOT correct values. You only flag.
+Return STRICT JSON only."""
+
+VISUAL_CRITIC_USER = """\
+Audit the visual-classification claims for this map.
+
+Filename: {filename}
+
+═══ VISUAL CLAIMS ═══
+{claims_json}
+
+Be lenient — these are interpretive. Only flag clearly-wrong
+classifications.
+
+""" + _CRITIC_RETURN_SHAPE
+
+
+# Field → domain mapping. type_specific.* fields all go to "visual"
+# (free-form bag, easiest to audit lightly).
+_FIELD_DOMAINS: dict[str, str] = {
+    # Geo (strict)
+    "country":          "geo",
+    "province":         "geo",
+    "city":             "geo",
+    "district":         "geo",
+    "coordinates_text": "geo",
+    "bbox_west":        "geo",
+    "bbox_east":        "geo",
+    "bbox_south":       "geo",
+    "bbox_north":       "geo",
+    # OCR (medium)
+    "title":            "ocr",
+    "date_text":        "ocr",
+    "date_year":        "ocr",
+    "publisher":        "ocr",
+    "scale_text":       "ocr",
+    "scale_ratio":      "ocr",
+    "projection":       "ocr",
+    "edition":          "ocr",
+    "legend_content":   "ocr",
+    "notes":            "ocr",
+    "place_names":      "ocr",
+    # Visual (lenient)
+    "map_type":         "visual",
+    "subject":          "visual",
+    "coverage":         "visual",
+    "medium":           "visual",
+    "language":         "visual",
+    "condition":        "visual",
+    "has_insets":       "visual",
+    "description":      "visual",
+}
+
+
+def _domain_of(field_key: str) -> str:
+    """Pick the right specialist domain for a field key."""
+    if field_key.startswith("type_specific."):
+        return "visual"
+    return _FIELD_DOMAINS.get(field_key, "visual")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -719,8 +1014,15 @@ Rules for this corrective round:
 - Include ONLY: (1) corrected versions of flagged fields, AND (2) any
   fields the fact-checker accepted (you may copy those verbatim from your
   prior response).
-- For each previously-flagged field, either provide a fresh
-  evidence_bbox + value + evidence_text + evidence_kind, OR omit it.
+- IMPORTANT: If a flagged field's VALUE is actually correct (you can
+  still see it on the map), KEEP THE VALUE — just provide a tighter
+  evidence_bbox. The critic mostly flags wide bboxes; that is a
+  bbox problem, not a value problem.
+- For each previously-flagged field, either provide a TIGHTER
+  evidence_bbox + same/corrected value + evidence_text + evidence_kind,
+  OR omit it (only if the value really isn't on the map).
+- A tight bbox is 5-40% wide for text, narrow strips along edges for
+  coordinates, etc. [0,0,100,100] is NOT acceptable as a correction.
 - Do NOT introduce new field names that were not in your previous output.
 - Do NOT defend an outside-knowledge claim — if the value is not visible
   in the image, omit the field.
@@ -1122,26 +1424,46 @@ def _build_correction_summary(claims: dict, verdicts: dict) -> str:
     return json.dumps(flagged, indent=2, ensure_ascii=False)
 
 
-async def _run_critic(
+# Templates for each specialist — kept as keys so prompt_templates router
+# can expose them for runtime editing.
+_DOMAIN_TEMPLATE_KEYS = {
+    "geo":    ("GEO_CRITIC_SYSTEM",    "GEO_CRITIC_USER"),
+    "ocr":    ("OCR_CRITIC_SYSTEM",    "OCR_CRITIC_USER"),
+    "visual": ("VISUAL_CRITIC_SYSTEM", "VISUAL_CRITIC_USER"),
+}
+
+_DOMAIN_LABEL = {"geo": "Geo", "ocr": "OCR", "visual": "Visual"}
+
+
+def _partition_claims_by_domain(claims: dict) -> dict[str, dict]:
+    """Split a flat claims dict into {domain: {field: claim}} buckets."""
+    buckets: dict[str, dict] = {"geo": {}, "ocr": {}, "visual": {}}
+    for k, v in claims.items():
+        dom = _domain_of(k)
+        buckets[dom][k] = v
+    return buckets
+
+
+async def _run_one_specialist(
+    domain: str,
     image_b64: str,
     media_type: str,
     filename: str,
-    fields: dict,
-    type_specific: dict,
+    domain_claims: dict,
     critic_model: str,
     critic_api_key: str,
     max_tokens: int,
     context=None,
     row_info=None,
-) -> tuple[dict, dict, LLMUsage]:
-    """Run the grounding critic. Returns (verdicts, claims_sent, usage)."""
-    claims = _build_claims_for_critic(fields, type_specific)
-    if not claims:
-        return {}, {}, LLMUsage()
+) -> tuple[dict, LLMUsage]:
+    """Run a single specialist critic on its slice of claims."""
+    if not domain_claims:
+        return {}, LLMUsage()
 
-    claims_json = json.dumps(claims, indent=2, ensure_ascii=False, default=str)
-    sys_p = _get_tmpl("CRITIC_SYSTEM")
-    user_text = _get_tmpl("CRITIC_USER").format(
+    sys_key, usr_key = _DOMAIN_TEMPLATE_KEYS[domain]
+    sys_p = _get_tmpl(sys_key)
+    claims_json = json.dumps(domain_claims, indent=2, ensure_ascii=False, default=str)
+    user_text = _get_tmpl(usr_key).format(
         filename=filename, claims_json=claims_json,
     )
     user_msg = _make_vision_message(user_text, image_b64, media_type)
@@ -1150,8 +1472,9 @@ async def _run_critic(
         await context.emit("ai_debug", {
             **row_info,
             "phase": "critic_start",
+            "domain": domain,
             "critic_model": critic_model,
-            "claim_count": len(claims),
+            "claim_count": len(domain_claims),
         })
 
     try:
@@ -1164,18 +1487,23 @@ async def _run_critic(
             await context.emit("ai_debug", {
                 **row_info,
                 "phase": "error",
-                "error": f"Critic call failed: {exc}"[:500],
+                "error": f"Critic[{domain}] call failed: {exc}"[:500],
             })
-        return {}, claims, LLMUsage()
+        return {}, LLMUsage()
 
     parsed = extract_json(resp.text) or {}
     verdicts = _parse_verdicts(parsed)
+
+    # Keep only verdicts for fields we actually sent — defends against
+    # hallucinated field names in critic output
+    verdicts = {k: v for k, v in verdicts.items() if k in domain_claims}
 
     if context and row_info:
         flagged = [f for f, v in verdicts.items() if not v.get("ok")]
         await context.emit("ai_debug", {
             **row_info,
             "phase": "critic_review",
+            "domain": domain,
             "verdicts": verdicts,
             "flagged_count": len(flagged),
             "flagged_fields": flagged,
@@ -1185,7 +1513,61 @@ async def _run_critic(
             },
         })
 
-    return verdicts, claims, resp.usage
+    return verdicts, resp.usage
+
+
+async def _run_specialist_critics(
+    image_b64: str,
+    media_type: str,
+    filename: str,
+    fields: dict,
+    type_specific: dict,
+    critic_model: str,
+    critic_api_key: str,
+    max_tokens: int,
+    context=None,
+    row_info=None,
+) -> tuple[dict, dict, LLMUsage]:
+    """Run geo / ocr / visual critics in parallel on their slices.
+
+    Returns (merged_verdicts, claims_sent, total_usage).
+    """
+    claims = _build_claims_for_critic(fields, type_specific)
+    if not claims:
+        return {}, {}, LLMUsage()
+
+    buckets = _partition_claims_by_domain(claims)
+
+    # Run the three specialists concurrently — each gets its own slice
+    results = await asyncio.gather(
+        _run_one_specialist(
+            "geo", image_b64, media_type, filename, buckets["geo"],
+            critic_model, critic_api_key, max_tokens, context, row_info,
+        ),
+        _run_one_specialist(
+            "ocr", image_b64, media_type, filename, buckets["ocr"],
+            critic_model, critic_api_key, max_tokens, context, row_info,
+        ),
+        _run_one_specialist(
+            "visual", image_b64, media_type, filename, buckets["visual"],
+            critic_model, critic_api_key, max_tokens, context, row_info,
+        ),
+        return_exceptions=False,
+    )
+
+    merged_verdicts: dict = {}
+    total = LLMUsage()
+    for verdicts, usage in results:
+        merged_verdicts.update(verdicts)
+        total.input_tokens += usage.input_tokens
+        total.output_tokens += usage.output_tokens
+
+    return merged_verdicts, claims, total
+
+
+# Back-compat shim — the old single-critic name still callable.
+async def _run_critic(*args, **kwargs):
+    return await _run_specialist_critics(*args, **kwargs)
 
 
 def _apply_corrections(prev_fields: dict, prev_ts: dict,
@@ -1351,21 +1733,55 @@ class AIMapAnalysisNode(BaseNode):
 
         # Output columns
         original_columns = set(df.columns.tolist())
+
+        # Physical dimensions (filename-derived; ground truth depends on the
+        # operator naming the file correctly — may NOT match what was scanned)
         if "map_width_cm" not in df.columns:
             df["map_width_cm"] = 0.0
         if "map_height_cm" not in df.columns:
             df["map_height_cm"] = 0.0
+
+        # Image-file physical info read from the image itself.
+        # These are ground-truth for the scan (independent of the filename).
+        for col, default in [
+            ("map_pixel_w", 0), ("map_pixel_h", 0),
+            ("map_dpi_x", 0.0), ("map_dpi_y", 0.0),
+            ("map_image_w_cm", 0.0), ("map_image_h_cm", 0.0),
+            ("map_scale_source", ""),
+        ]:
+            if col not in df.columns:
+                df[col] = default
+
         for idx_dim, row_dim in df.iterrows():
-            fn = os.path.basename(str(row_dim.get(image_column, "")))
+            path = str(row_dim.get(image_column, "")).strip()
+            fn = os.path.basename(path)
+            # Filename-claimed dimensions (preserved for backward compat)
             w_cm, h_cm = _extract_dimensions_cm(fn)
             if w_cm > 0:
                 df.at[idx_dim, "map_width_cm"] = w_cm
                 df.at[idx_dim, "map_height_cm"] = h_cm
+            # Image-derived physical info
+            if path and os.path.isfile(path):
+                info = _read_image_physical_info(path)
+                df.at[idx_dim, "map_pixel_w"] = info["pixel_w"]
+                df.at[idx_dim, "map_pixel_h"] = info["pixel_h"]
+                df.at[idx_dim, "map_dpi_x"] = info["dpi_x"]
+                df.at[idx_dim, "map_dpi_y"] = info["dpi_y"]
+                df.at[idx_dim, "map_image_w_cm"] = info["image_w_cm"]
+                df.at[idx_dim, "map_image_h_cm"] = info["image_h_cm"]
+
         for _, out_col in MAP_FIELDS:
             if out_col not in df.columns:
                 df[out_col] = ""
         if "map_regions_preview" not in df.columns:
             df["map_regions_preview"] = ""
+        # Audit columns — fields that critic touched but were KEPT (uncertain)
+        # vs fields critic finally rejected (demoted to empty). Surface these
+        # so a human reviewer can scan only the rows that warrant attention.
+        if "map_review_fields_uncertain" not in df.columns:
+            df["map_review_fields_uncertain"] = ""
+        if "map_review_fields_demoted" not in df.columns:
+            df["map_review_fields_demoted"] = ""
         new_columns = [c for c in df.columns if c not in original_columns]
 
         total = len(df)
@@ -1489,6 +1905,11 @@ class AIMapAnalysisNode(BaseNode):
                     # ─── Critic loop ────────────────────────────────────
                     last_verdicts: dict = {}
                     last_claims: dict = {}
+                    # Per-field provenance for the audit columns: which fields
+                    # were flagged at any point during the loop. Even if a
+                    # field ultimately survives (extractor fixed it), the fact
+                    # that it had to be challenged is signal for human review.
+                    ever_flagged: set[str] = set()
 
                     if critic_model and critic_api_key and (fields or type_specific):
                         for round_idx in range(max(1, max_correction_rounds + 1)):
@@ -1496,7 +1917,7 @@ class AIMapAnalysisNode(BaseNode):
                             if round_idx > max_correction_rounds:
                                 break
 
-                            verdicts, claims, c_usage = await _run_critic(
+                            verdicts, claims, c_usage = await _run_specialist_critics(
                                 img_b64, img_mime, filename,
                                 fields, type_specific,
                                 critic_model, critic_api_key,
@@ -1509,6 +1930,7 @@ class AIMapAnalysisNode(BaseNode):
 
                             flagged = [k for k, v in verdicts.items()
                                        if not v.get("ok")]
+                            ever_flagged.update(flagged)
                             if not flagged:
                                 break
                             if round_idx >= max_correction_rounds:
@@ -1575,25 +1997,40 @@ class AIMapAnalysisNode(BaseNode):
                                 })
 
                     # ─── Final pass: demote any field critic still rejects ──
+                    demoted: set[str] = set()
                     if last_verdicts:
                         for k, v in list(last_verdicts.items()):
                             if v.get("ok"):
                                 continue
                             if k.startswith("type_specific."):
                                 ts_key = k[len("type_specific."):]
-                                # If field is unchanged from when critic flagged it,
-                                # drop it
                                 if ts_key in type_specific:
                                     prev_val = (last_claims.get(k) or {}).get("value")
                                     cur_val = type_specific[ts_key].get("value")
                                     if prev_val == cur_val:
                                         type_specific.pop(ts_key, None)
+                                        demoted.add(k)
                             else:
                                 if k in fields:
                                     prev_val = (last_claims.get(k) or {}).get("value")
                                     cur_val = fields[k].get("value")
                                     if prev_val == cur_val:
                                         fields.pop(k, None)
+                                        demoted.add(k)
+                    # Fields that were flagged at some point but survived
+                    # — those are "uncertain" and worth manual review.
+                    uncertain: set[str] = ever_flagged - demoted - {
+                        k for k in ever_flagged
+                        if (k.startswith("type_specific.")
+                            and k[len("type_specific."):] not in type_specific)
+                        or (not k.startswith("type_specific.") and k not in fields)
+                    }
+                    df.at[idx, "map_review_fields_uncertain"] = (
+                        ", ".join(sorted(uncertain)) if uncertain else ""
+                    )
+                    df.at[idx, "map_review_fields_demoted"] = (
+                        ", ".join(sorted(demoted)) if demoted else ""
+                    )
 
                     # ─── Evidence preview image ─────────────────────────
                     if fields or type_specific:
@@ -1629,6 +2066,19 @@ class AIMapAnalysisNode(BaseNode):
                         df.at[idx, out_col] = _coerce_value(
                             json_key, entry.get("value", "")
                         )
+
+                    # Tag where the scale_ratio came from so a human reviewer
+                    # knows which values warrant manual verification (numbers
+                    # derived from a graphical scale bar are inherently
+                    # less precise than printed ratios).
+                    scale_entry = fields.get("scale_ratio")
+                    if scale_entry:
+                        df.at[idx, "map_scale_source"] = _classify_scale_source(
+                            scale_entry.get("evidence_text", ""),
+                            scale_entry.get("evidence_kind", ""),
+                        )
+                    else:
+                        df.at[idx, "map_scale_source"] = ""
 
                     for ts_key, entry in type_specific.items():
                         col = f"ts_{ts_key}"

@@ -55,12 +55,23 @@ class OpenRouterProvider(LLMProvider):
             ModelInfo("qwen/qwen2.5-vl-72b-instruct", "Qwen2.5 VL 72B Instruct", "openrouter", 128000, 16384),
             ModelInfo("qwen/qwen2.5-vl-32b-instruct", "Qwen2.5 VL 32B Instruct", "openrouter", 128000, 16384),
             ModelInfo("qwen/qwen3-vl-8b-instruct", "Qwen3 VL 8B Instruct", "openrouter", 128000, 16384),
+            ModelInfo("qwen/qwen3-vl-32b-instruct", "Qwen3 VL 32B Instruct", "openrouter", 128000, 32768),
+            ModelInfo("qwen/qwen3-vl-30b-a3b-instruct", "Qwen3 VL 30B A3B Instruct", "openrouter", 128000, 16384),
+            # ── Cross-family vision (use as critic for independent verification) ──
+            ModelInfo("anthropic/claude-sonnet-4.5", "Claude Sonnet 4.5 (via OR)", "openrouter", 200000, 8192),
+            ModelInfo("anthropic/claude-3.5-sonnet", "Claude 3.5 Sonnet (via OR)", "openrouter", 200000, 8192),
+            ModelInfo("anthropic/claude-3-haiku", "Claude 3 Haiku (via OR)", "openrouter", 200000, 4096),
+            ModelInfo("openai/gpt-4o", "GPT-4o (via OR)", "openrouter", 128000, 16384),
+            ModelInfo("openai/gpt-4o-mini", "GPT-4o mini (via OR)", "openrouter", 128000, 16384),
+            # ── Cheap critic / extractor candidates (Gemini & Llama) ──
+            ModelInfo("google/gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite (via OR)", "openrouter", 1000000, 65536),
+            ModelInfo("google/gemini-2.0-flash-001", "Gemini 2.0 Flash (via OR)", "openrouter", 1000000, 65536),
+            ModelInfo("google/gemini-2.0-flash-lite-001", "Gemini 2.0 Flash Lite (via OR)", "openrouter", 1000000, 65536),
+            ModelInfo("meta-llama/llama-3.2-11b-vision-instruct", "Llama 3.2 11B Vision (via OR)", "openrouter", 128000, 8192),
             # ── Text-only flagship ──
             ModelInfo("deepseek/deepseek-r1", "DeepSeek R1", "openrouter", 128000, 16384),
             ModelInfo("deepseek/deepseek-chat-v3-0324", "DeepSeek V3", "openrouter", 128000, 16384),
             ModelInfo("qwen/qwen3-235b-a22b", "Qwen3 235B", "openrouter", 128000, 16384),
-            ModelInfo("google/gemini-2.5-pro-preview", "Gemini 2.5 Pro (via OR)", "openrouter", 1000000, 65536),
-            ModelInfo("google/gemini-2.5-flash-preview", "Gemini 2.5 Flash (via OR)", "openrouter", 1000000, 65536),
         ]
 
     @classmethod
