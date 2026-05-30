@@ -1,8 +1,51 @@
 """OpenRouter provider — aggregated access to hundreds of models via OpenAI-compatible API."""
 import asyncio
+import os
 from .base import LLMProvider, ModelInfo, LLMResponse, LLMUsage
 
 _BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _privacy_extra_body() -> dict | None:
+    """Per-request privacy extras for OpenRouter.
+
+    Enable strict data-collection refusal by setting one of:
+      OPENROUTER_REQUIRE_PRIVACY=1
+      OPENROUTER_REQUIRE_PRIVACY=true
+      OPENROUTER_REQUIRE_PRIVACY=deny
+
+    When enabled, every request tells OpenRouter to route ONLY to
+    upstream providers that have committed not to use prompts / images
+    for training. If no compliant provider exists for the requested
+    model, OpenRouter returns 404 — better a loud failure than a silent
+    leak.
+
+    When unset (default), no extras are sent and OpenRouter uses the
+    account-level privacy settings configured at
+    https://openrouter.ai/settings/privacy. That dashboard setting is
+    the recommended primary defence; this env-var flag is an additional
+    code-level belt-and-suspenders for sensitive runs.
+
+    See:
+    https://openrouter.ai/docs/features/provider-routing#requiring-providers-to-comply-with-data-policies
+    """
+    flag = os.environ.get("OPENROUTER_REQUIRE_PRIVACY", "").strip().lower()
+    if flag not in ("1", "true", "yes", "deny", "on"):
+        return None
+    return {
+        "provider": {
+            "data_collection": "deny",
+            "allow_fallbacks": True,
+        },
+    }
+
+
+def _create_kwargs(base: dict) -> dict:
+    """Add extra_body=privacy when enabled; pass-through otherwise."""
+    extra = _privacy_extra_body()
+    if extra is not None:
+        base = {**base, "extra_body": extra}
+    return base
 
 
 def _extract_usage(response) -> LLMUsage:
@@ -80,14 +123,14 @@ class OpenRouterProvider(LLMProvider):
 
         def _sync():
             client = OpenAI(api_key=api_key, base_url=_BASE_URL, timeout=600)
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[
+            response = client.chat.completions.create(**_create_kwargs({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-            )
+            }))
             return _extract_text(response)
 
         return await asyncio.to_thread(_sync)
@@ -98,17 +141,17 @@ class OpenRouterProvider(LLMProvider):
 
         def _sync():
             client = OpenAI(api_key=api_key, base_url=_BASE_URL, timeout=600)
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=[
+            response = client.chat.completions.create(**_create_kwargs({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": [
                         {"type": "text", "text": user_text},
                         {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_data}"}},
                     ]},
                 ],
-            )
+            }))
             return LLMResponse(
                 text=_extract_text(response),
                 usage=_extract_usage(response),
@@ -144,11 +187,11 @@ class OpenRouterProvider(LLMProvider):
                     "role": msg["role"],
                     "content": _convert_content(msg["content"]),
                 })
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                messages=openai_messages,
-            )
+            response = client.chat.completions.create(**_create_kwargs({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": openai_messages,
+            }))
             return LLMResponse(
                 text=_extract_text(response),
                 usage=_extract_usage(response),
