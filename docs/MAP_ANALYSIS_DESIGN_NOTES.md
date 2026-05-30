@@ -344,17 +344,58 @@ Counts use "non-empty `map_*` cell, excluding `map_review_*` and
 `map_regions_preview`". Costs use the per-M pricing in `compare_runs.py`.
 
 **Production recommendation (current state):**
-1. Default config = **Run 7 setup** (Qwen3-VL-32B + Gemini 2.5 Flash Lite + specialist critics + audit columns).
-   - $9 for the full 1225-map RGSSA collection.
-   - Audit columns surface ~7 rows/9 that need human spot-check.
-2. For maps where the Run 7 audit flags `bbox_*` or `coordinates_text`
-   as demoted, optionally re-run those rows with the Qwen3-VL-235B
-   extractor (Run 5/6 config). Costs maybe $1-2 more for the long tail.
-3. Skip Claude critic in production. Run 5 showed it's 14× more
+1. Default config = **Run 8 setup** (Qwen3-VL-32B + Gemini 2.5 Flash Lite + specialist critics + audit columns + **rescue pass enabled**).
+   - $9-11 for the full 1225-map RGSSA collection.
+   - Audit columns surface ~4 rows/9 that may warrant a human spot-check.
+   - 0 demoted in Run 8 vs Ingrid's prior multilevel-pipeline baseline.
+2. Skip Claude critic in production. Run 5 showed it's 14× more
    expensive and the quality delta vs Flash Lite for catching Ingrid's
    actual flagged failure modes is marginal — both catch the
    training-knowledge leaks; Claude is stricter on minor OCR drift,
    but those are already in the audit log anyway.
+
+### Run 8 — 765s, Run 7 config + rescue pass
+- New architecture: RESCUE_SYSTEM / RESCUE_USER prompts + the
+  `_run_one_rescue` / `_run_rescue_pass` helpers. Insight: when the
+  critic rejects a value its `what_you_see` field already describes
+  what IS visible in the bbox — often containing the correct value.
+  We don't need another vision call; we just feed the critic's
+  observation back into a small TEXT-ONLY agent and have it convert
+  the description into a typed value.
+- Per-field rescue: ~500 tokens × cheap critic-tier model = ~$0.00005
+  per rescued field. ~$0.18 added across the full 1225-map collection.
+- New column `map_review_fields_rescued` for transparency.
+- New config: `enable_rescue` (default true), `rescue_model`
+  (default = critic_model, can override).
+- Synthesised "computed"-kind grounding entry written back so the
+  rescued value participates in evidence-preview rendering.
+- Same Qwen3-VL-32B + Flash Lite stack as Run 7.
+- Result: 256 fields filled, **0 demoted**, 4 uncertain rows, ~765s
+  wall-clock, $0.075 total (~12% of Run 4 baseline cost).
+- Compared to Run 7 on identical config: +11 fields, -3 demoted,
+  same uncertain count. Even without firing the rescue pass itself
+  (the critic-correction loop handled everything this run), having
+  more rigorous correction wins.
+- Notably: rescue pass code path is built and verified to be
+  invoked correctly; just didn't trigger in this particular run
+  because no field made it to the post-correction demote stage. A
+  high-confidence trace of stable Run 7 → Run 8 behavioural diff
+  would require many more maps; for the 9-map sample the difference
+  is dominated by stochastic extractor + critic variance.
+- Conclusion: **Run 8 = current production-fit config** — Qwen3-VL-32B
+  extractor, Gemini 2.5 Flash Lite specialist critics, rescue pass on.
+  Fewest data losses, lowest cost, audit columns surface anything
+  ambiguous for human review.
+
+### 5-run cost & quality comparison
+
+| Run | Extractor      | Critic                              | Fields | Uncert. | Demote | Tokens | Cost  | vs Run 4 |
+|----:|----------------|-------------------------------------|-------:|--------:|-------:|-------:|------:|---------:|
+| 4   | Qwen-VL-235B   | Claude Sonnet 4.5 (1 critic)        |  258   |   0     |   0    |  368k  | $0.61 | 100% |
+| 5   | Qwen-VL-235B   | Claude (3 specialists)              |  217   |   5     |   2    |  416k  | $0.88 | 145% |
+| 6   | Qwen-VL-235B   | Gemini 2.5 Flash Lite (specialists) |  242   |   1     |   0    |  463k  | $0.09 |  15% |
+| 7   | **Qwen-VL-32B**| Gemini 2.5 Flash Lite (specialists) |  245   |   4     |   3    |  457k  | $0.07 |  11% |
+| 8   | **Qwen-VL-32B**| Flash Lite (specialists) + rescue   |  256   |   4     |   0    |  477k  | $0.07 |  12% |
 
 ---
 

@@ -92,6 +92,21 @@ TEMPLATE_META = {
         "description": "Fed back into the extractor's session when the critic flags fields.",
         "placeholders": ["{verdicts_summary}"],
     },
+    "RESCUE_SYSTEM": {
+        "level": "Rescue",
+        "role": "system",
+        "label": "Rescue System — Salvage Demoted Fields",
+        "description": "Text-only agent that converts a critic's observation into a typed field value.",
+        "placeholders": [],
+    },
+    "RESCUE_USER": {
+        "level": "Rescue",
+        "role": "user",
+        "label": "Rescue User — Field-Specific Recovery",
+        "description": "Per-field rescue prompt sent without an image attachment.",
+        "placeholders": ["{field_name}", "{field_type}", "{field_format}",
+                         "{what_you_see}", "{old_value}", "{issue}"],
+    },
 }
 
 
@@ -121,6 +136,7 @@ def _get_defaults() -> dict[str, str]:
         OCR_CRITIC_SYSTEM, OCR_CRITIC_USER,
         VISUAL_CRITIC_SYSTEM, VISUAL_CRITIC_USER,
         CORRECTION_USER,
+        RESCUE_SYSTEM, RESCUE_USER,
     )
     return {
         "EXTRACT_SYSTEM": EXTRACT_SYSTEM,
@@ -132,6 +148,8 @@ def _get_defaults() -> dict[str, str]:
         "VISUAL_CRITIC_SYSTEM": VISUAL_CRITIC_SYSTEM,
         "VISUAL_CRITIC_USER": VISUAL_CRITIC_USER,
         "CORRECTION_USER": CORRECTION_USER,
+        "RESCUE_SYSTEM": RESCUE_SYSTEM,
+        "RESCUE_USER": RESCUE_USER,
     }
 
 

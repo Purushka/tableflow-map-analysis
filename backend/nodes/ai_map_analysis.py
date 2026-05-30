@@ -1031,6 +1031,95 @@ Rules for this corrective round:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Rescue prompt — salvages demoted fields from the critic's own observations
+#
+# Insight: when the critic rejects a value, its `what_you_see` field already
+# describes what IS actually visible in that bbox region — often containing
+# the correct OCR'd text or computed value. We don't need to re-call a vision
+# model; we just ask a small TEXT-ONLY model to convert the critic's free-form
+# observation into a typed field value. Marginal cost per call.
+# ═════════════════════════════════════════════════════════════════════════════
+
+RESCUE_SYSTEM = """\
+You are a metadata recovery agent. A previous extraction was demoted
+because the fact-checker disagreed with the value but provided their
+own observation of what IS visible in the region. Your job: convert
+the fact-checker's observation into the correct value for the
+specified field — IF the observation actually contains enough
+information to do so confidently.
+
+You receive ONLY text. Do NOT speculate beyond what the observation
+states. If the observation does not clearly contain a value for the
+requested field, return value=null and confident=false.
+
+Return STRICT JSON only — no commentary."""
+
+RESCUE_USER = """\
+Field to recover: {field_name}
+Field type:       {field_type}
+Expected format:  {field_format}
+
+The fact-checker's observation about that region of the map:
+\"\"\"{what_you_see}\"\"\"
+
+The extractor's previously-rejected guess (for context — do NOT
+default to it): {old_value}
+Why it was rejected: {issue}
+
+Return STRICT JSON:
+
+{{
+  "value": <a value of the expected type, or null if the observation
+           does not clearly contain one>,
+  "confident": <true if you are highly confident the value is correct
+                from the observation alone; false if you have to guess>,
+  "reasoning": "<one short sentence>"
+}}
+
+Rules:
+- If the observation only describes the region in general terms
+  without stating the specific value, return value=null.
+- For numeric fields (date_year, scale_ratio, bbox_west, etc.),
+  value must be a JSON number, not a string.
+- For coordinate fields (bbox_*), convert from degree/minute/second
+  text to decimal degrees (west/south are negative).
+- Never invent information that is not in the observation."""
+
+
+# Per-field hints for the rescue prompt — what shape the value should
+# take. Defaults to "string" if not listed.
+_RESCUE_FIELD_HINTS: dict[str, tuple[str, str]] = {
+    "title":            ("string", "exact title text"),
+    "date_text":        ("string", "date as printed"),
+    "date_year":        ("integer", "4-digit year"),
+    "publisher":        ("string", "publisher name only"),
+    "scale_text":       ("string", "scale as printed"),
+    "scale_ratio":      ("integer", "denominator only (e.g. 63360 for 1:63,360)"),
+    "projection":       ("string", "projection name"),
+    "edition":          ("string", "edition text"),
+    "coordinates_text": ("string", "lat/long range as text"),
+    "bbox_west":        ("number",  "decimal degrees, NEGATIVE for west hemisphere"),
+    "bbox_east":        ("number",  "decimal degrees, NEGATIVE for west hemisphere"),
+    "bbox_south":       ("number",  "decimal degrees, NEGATIVE for south hemisphere"),
+    "bbox_north":       ("number",  "decimal degrees, NEGATIVE for south hemisphere"),
+    "place_names":      ("string", "comma-separated, up to 15"),
+    "legend_content":   ("string", "main legend entries"),
+    "notes":            ("string", "printed notes"),
+    "country":          ("string", "country name(s) comma-separated"),
+    "province":         ("string", "state/province"),
+    "city":             ("string", "city name"),
+    "district":         ("string", "district/county"),
+    "language":         ("string", "language name(s)"),
+}
+
+
+def _rescue_field_hint(field_key: str) -> tuple[str, str]:
+    # type_specific.* fields fall through to string
+    base = field_key[len("type_specific."):] if field_key.startswith("type_specific.") else field_key
+    return _RESCUE_FIELD_HINTS.get(base, ("string", "free-form value"))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Image helpers — all output as JPEG
 #   Crops:     JPG quality=100 (no compression) — max detail within API limit
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1570,6 +1659,154 @@ async def _run_critic(*args, **kwargs):
     return await _run_specialist_critics(*args, **kwargs)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Rescue pass — recover demoted fields from the critic's own observation
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _run_one_rescue(
+    field_key: str,
+    old_value,
+    issue: str,
+    what_you_see: str,
+    rescue_model: str,
+    rescue_api_key: str,
+    max_tokens: int,
+    context=None,
+    row_info=None,
+) -> tuple[dict | None, LLMUsage]:
+    """Send a single text-only rescue request for one demoted field.
+
+    Returns (rescue_result_dict_or_None, usage).
+    """
+    if not what_you_see or not what_you_see.strip():
+        return None, LLMUsage()
+
+    ftype, fformat = _rescue_field_hint(field_key)
+    sys_p = _get_tmpl("RESCUE_SYSTEM")
+    user_text = _get_tmpl("RESCUE_USER").format(
+        field_name=field_key,
+        field_type=ftype,
+        field_format=fformat,
+        what_you_see=what_you_see.strip(),
+        old_value=json.dumps(old_value, ensure_ascii=False, default=str),
+        issue=(issue or "").strip(),
+    )
+
+    # Use the text-only call path — no image attached. Reuses
+    # providers' call_vision_conversation but with a text-only message.
+    msgs = [_make_text_message(user_text)]
+    try:
+        resp = await _call_conversation_with_recitation_retry(
+            rescue_model, sys_p, msgs, max_tokens, rescue_api_key,
+            context, row_info,
+        )
+    except Exception as exc:
+        if context and row_info:
+            await context.emit("ai_debug", {
+                **row_info,
+                "phase": "error",
+                "error": f"Rescue[{field_key}] call failed: {exc}"[:500],
+            })
+        return None, LLMUsage()
+
+    parsed = extract_json(resp.text) or {}
+    if not isinstance(parsed, dict):
+        return None, resp.usage
+
+    val = parsed.get("value")
+    confident = bool(parsed.get("confident", False))
+    reasoning = str(parsed.get("reasoning", "") or "")[:300]
+
+    return {
+        "value": val,
+        "confident": confident,
+        "reasoning": reasoning,
+    }, resp.usage
+
+
+async def _run_rescue_pass(
+    last_verdicts: dict,
+    last_claims: dict,
+    demoted_keys: set[str],
+    rescue_model: str,
+    rescue_api_key: str,
+    max_tokens: int,
+    context=None,
+    row_info=None,
+) -> tuple[dict, LLMUsage]:
+    """Try to salvage each demoted field from its critic's own observation.
+
+    Returns ({field_key: rescued_value_dict}, total_usage). Caller
+    decides whether to write the value back to the dataframe.
+
+    No image is sent — this is a pure-text extraction of the critic's
+    `what_you_see` notes into a typed value. Marginal cost.
+    """
+    rescues: dict[str, dict] = {}
+    total = LLMUsage()
+    if not demoted_keys or not rescue_model or not rescue_api_key:
+        return rescues, total
+
+    targets = []
+    for k in demoted_keys:
+        v = last_verdicts.get(k, {})
+        if v.get("ok"):
+            continue
+        wys = v.get("what_you_see", "")
+        if not wys or not wys.strip():
+            continue
+        claim = last_claims.get(k, {})
+        targets.append((k, claim.get("value"), v.get("issue", ""), wys))
+
+    if not targets:
+        return rescues, total
+
+    if context and row_info:
+        await context.emit("ai_debug", {
+            **row_info,
+            "phase": "rescue_start",
+            "rescue_model": rescue_model,
+            "field_count": len(targets),
+            "fields": [k for k, *_ in targets],
+        })
+
+    results = await asyncio.gather(*(
+        _run_one_rescue(
+            k, old, issue, wys,
+            rescue_model, rescue_api_key, max_tokens,
+            context, row_info,
+        )
+        for k, old, issue, wys in targets
+    ), return_exceptions=False)
+
+    successes = []
+    for (k, old, issue, wys), (rescue_result, usage) in zip(targets, results):
+        total.input_tokens += usage.input_tokens
+        total.output_tokens += usage.output_tokens
+        if not rescue_result:
+            continue
+        if not rescue_result.get("confident"):
+            continue
+        if rescue_result.get("value") in (None, "", "null"):
+            continue
+        rescues[k] = rescue_result
+        successes.append(k)
+
+    if context and row_info:
+        await context.emit("ai_debug", {
+            **row_info,
+            "phase": "rescue_result",
+            "rescued_count": len(successes),
+            "rescued_fields": successes,
+            "tokens": {
+                "input_tokens": total.input_tokens,
+                "output_tokens": total.output_tokens,
+            },
+        })
+
+    return rescues, total
+
+
 def _apply_corrections(prev_fields: dict, prev_ts: dict,
                        new_fields: dict, new_ts: dict,
                        verdicts: dict) -> tuple[dict, dict]:
@@ -1660,6 +1897,25 @@ class AIMapAnalysisNode(BaseNode):
                                 "feeding corrections back.",
                 ),
                 ConfigField(
+                    name="enable_rescue",
+                    label="Rescue demoted fields",
+                    type="boolean",
+                    default=True,
+                    description="After the critic finalises its verdicts, attempt "
+                                "to recover demoted fields by parsing the critic's "
+                                "own observation (what_you_see) into a typed value. "
+                                "Text-only call, ~$0.00005 per rescued field.",
+                ),
+                ConfigField(
+                    name="rescue_model",
+                    label="Rescue Model",
+                    type="select",
+                    default="",
+                    options=[],
+                    description="Small text-mode model that converts critic notes "
+                                "into structured values. Defaults to the critic model.",
+                ),
+                ConfigField(
                     name="dublin_core_export",
                     label="Dublin Core columns",
                     type="boolean",
@@ -1731,6 +1987,25 @@ class AIMapAnalysisNode(BaseNode):
                     f"No API key for critic '{critic_model}'. Set it in Settings."
                 )
 
+        # Rescue model recovers demoted fields from the critic's own
+        # observation. Defaults to the critic model since the call is
+        # text-only and small. Set to "" to disable rescue.
+        rescue_model = (
+            config.get("rescue_model")
+            or critic_model
+            or ""
+        ).strip() if config.get("enable_rescue", True) else ""
+        rescue_api_key = ""
+        if rescue_model and context:
+            try:
+                rescue_provider_id = get_provider_id_for_model(rescue_model)
+                rescue_api_key = context.get_api_key(rescue_provider_id)
+            except ValueError:
+                rescue_model = ""
+            if rescue_model and not rescue_api_key:
+                # Don't hard-fail — rescue is a quality boost, not core.
+                rescue_model = ""
+
         # Output columns
         original_columns = set(df.columns.tolist())
 
@@ -1782,6 +2057,8 @@ class AIMapAnalysisNode(BaseNode):
             df["map_review_fields_uncertain"] = ""
         if "map_review_fields_demoted" not in df.columns:
             df["map_review_fields_demoted"] = ""
+        if "map_review_fields_rescued" not in df.columns:
+            df["map_review_fields_rescued"] = ""
         new_columns = [c for c in df.columns if c not in original_columns]
 
         total = len(df)
@@ -2017,9 +2294,48 @@ class AIMapAnalysisNode(BaseNode):
                                     if prev_val == cur_val:
                                         fields.pop(k, None)
                                         demoted.add(k)
+                    # ─── Rescue pass — recover demoted fields from the
+                    #     critic's `what_you_see` notes. Text-only call,
+                    #     marginal cost.
+                    rescued_keys: set[str] = set()
+                    if rescue_model and rescue_api_key and demoted:
+                        rescues, r_usage = await _run_rescue_pass(
+                            last_verdicts, last_claims, demoted,
+                            rescue_model, rescue_api_key,
+                            max_tokens, context, _row,
+                        )
+                        _token_total["input"]  += r_usage.input_tokens
+                        _token_total["output"] += r_usage.output_tokens
+                        for k, r in rescues.items():
+                            val = r["value"]
+                            # Synthesize a minimal grounded entry so the
+                            # downstream writer treats it like any other
+                            # field. evidence_kind = "computed" because
+                            # the value was derived from the critic's
+                            # observation, not OCR'd directly.
+                            synth_entry = {
+                                "value": val,
+                                "evidence_bbox": (last_claims.get(k) or {}).get(
+                                    "evidence_bbox", [0, 0, 100, 100],
+                                ),
+                                "evidence_text": (
+                                    f"rescued from critic observation: "
+                                    f"{r.get('reasoning','')}"
+                                )[:400],
+                                "evidence_kind": "computed",
+                            }
+                            if k.startswith("type_specific."):
+                                ts_key = k[len("type_specific."):]
+                                type_specific[ts_key] = synth_entry
+                            else:
+                                fields[k] = synth_entry
+                            rescued_keys.add(k)
+                        # Demoted ↑ rescued — they're no longer "lost"
+                        demoted = demoted - rescued_keys
+
                     # Fields that were flagged at some point but survived
                     # — those are "uncertain" and worth manual review.
-                    uncertain: set[str] = ever_flagged - demoted - {
+                    uncertain: set[str] = ever_flagged - demoted - rescued_keys - {
                         k for k in ever_flagged
                         if (k.startswith("type_specific.")
                             and k[len("type_specific."):] not in type_specific)
@@ -2031,6 +2347,10 @@ class AIMapAnalysisNode(BaseNode):
                     df.at[idx, "map_review_fields_demoted"] = (
                         ", ".join(sorted(demoted)) if demoted else ""
                     )
+                    if "map_review_fields_rescued" in df.columns:
+                        df.at[idx, "map_review_fields_rescued"] = (
+                            ", ".join(sorted(rescued_keys)) if rescued_keys else ""
+                        )
 
                     # ─── Evidence preview image ─────────────────────────
                     if fields or type_specific:
