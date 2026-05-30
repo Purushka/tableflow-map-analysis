@@ -397,6 +397,23 @@ Counts use "non-empty `map_*` cell, excluding `map_review_*` and
 | 7   | **Qwen-VL-32B**| Gemini 2.5 Flash Lite (specialists) |  245   |   4     |   3    |  457k  | $0.07 |  11% |
 | 8   | **Qwen-VL-32B**| Flash Lite (specialists) + rescue   |  256   |   4     |   0    |  477k  | $0.07 |  12% |
 
+### Removed: Google free-tier concurrency cap
+Historical: the `concurrency` config defaulted to `min(4, len(df))` —
+inherited from when Google's free tier capped concurrent calls. With
+OpenRouter / Anthropic / OpenAI production tiers, that cap forced 1225
+maps to run 4-at-a-time, ~6 hours minimum.
+
+Change: default is now `len(df)` — all rows spawn concurrently at the
+start of the run, and `_with_retry` absorbs 429/5xx via exponential
+backoff (`_TRANSIENT_MARKERS` extended with `429`, `too many requests`,
+`overloaded`). Operator can still set `concurrency` explicitly if their
+provider has a tight per-second cap.
+
+Practical effect on the 1225-map projection: wall-clock drops from
+"~6h at concurrency=4 + ~$11" to "~10-30 min at full parallel + same
+$11" (token cost identical; we're paying for wall-clock with retries
+not extra API spend).
+
 ---
 
 ## 7. Ingrid's per-map issues — status by run

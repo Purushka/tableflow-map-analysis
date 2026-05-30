@@ -503,10 +503,12 @@ def _sanitize_bbox(bbox, label: str = "") -> list[float]:
 _TRANSIENT_MARKERS = (
     "connection error", "connection reset", "connection aborted",
     "timeout", "timed out", "deadline exceeded",
+    "429",  # rate-limit status code
     "503", "502", "504", "529",  # 529 = Anthropic overload
-    "rate limit", "rate-limit", "ratelimit",
+    "rate limit", "rate-limit", "ratelimit", "too many requests",
     "temporarily unavailable", "service unavailable",
     "upstream", "bad gateway",
+    "overloaded",
 )
 
 
@@ -1943,8 +1945,10 @@ class AIMapAnalysisNode(BaseNode):
                     label="Concurrency",
                     type="number",
                     default=0,
-                    description="Parallel images (0 = auto). Each image makes 1 + "
-                                "(2 × correction rounds) API calls when the critic is on.",
+                    description="Parallel images. 0 = no cap (one task per row, all "
+                                "in flight at once). OpenRouter and modern providers "
+                                "handle this; retries with backoff cover 429s. Set "
+                                "explicitly only if a tight rate limit forces it.",
                 ),
             ],
         )
@@ -1964,7 +1968,12 @@ class AIMapAnalysisNode(BaseNode):
 
         max_tokens = int(config.get("max_tokens", 16000))
         raw_conc = int(config.get("concurrency", 0))
-        concurrency = raw_conc if raw_conc > 0 else min(4, len(df))
+        # Default: spawn one task per row. Modern OpenRouter / Anthropic /
+        # OpenAI tiers don't have the strict per-second concurrency caps the
+        # Google free tier did, and _with_retry handles 429/5xx with exponential
+        # backoff. Override if a specific provider rate limit makes this too
+        # bursty.
+        concurrency = raw_conc if raw_conc > 0 else max(1, len(df))
         max_correction_rounds = max(0, int(config.get("max_correction_rounds", 2)))
 
         api_key = ""
