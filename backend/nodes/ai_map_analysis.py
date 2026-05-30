@@ -1122,6 +1122,106 @@ def _rescue_field_hint(field_key: str) -> tuple[str, str]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Reread prompt — focused single-field OCR on a cropped region
+#
+# When a critic flags an OCR-domain field, we crop the evidence_bbox at
+# original resolution and ask a fresh vision call to read JUST that
+# field's value from the crop alone. This is the "zoom in to fine print"
+# pattern fresh Claude does on its own; we get the same effect with a
+# focused per-field call.
+# ═════════════════════════════════════════════════════════════════════════════
+
+REREAD_SYSTEM = """\
+You are an OCR specialist for cartographic documents. You will receive
+a HIGH-RESOLUTION crop of a SINGLE area on a map. Read what is
+literally printed in this crop for the specified field. Do NOT
+speculate. If the value is not clearly visible in this crop, return
+value=null.
+
+Return STRICT JSON only — no commentary."""
+
+REREAD_USER = """\
+Crop description: {field_name} area from a historic map.
+Field type: {field_type}
+Field format: {field_format}
+
+A previous extractor reading was: {old_value}
+The fact-checker observed in this region: "{what_critic_saw}"
+
+Read the printed text in THIS CROP carefully and precisely. Do not
+rely on any external knowledge of the map. Return STRICT JSON:
+
+{{
+  "value": <the value typed as the expected format, or null if the
+           value cannot be read confidently from this crop>,
+  "confident": <true | false>,
+  "verbatim_text": "<the exact printed text you read in this crop>"
+}}
+
+Rules:
+- For numeric fields (date_year, scale_ratio, bbox_*), value must be
+  a JSON number. For coordinate fields convert deg/min/sec to decimal
+  degrees (west and south are negative).
+- If the crop is blurry, blank, or shows something different from
+  what the field name suggests, return value=null and confident=false.
+- Do NOT invent text that isn't in the crop."""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Presence-verify prompt — binary check that a claimed text label is
+# literally visible on a crop. This is the anti-hallucination check for
+# country / province / city / district fields, which the extractor is
+# prone to filling from geographic knowledge of which places border the
+# depicted region.
+# ═════════════════════════════════════════════════════════════════════════════
+
+PRESENCE_VERIFY_SYSTEM = """\
+You verify whether a specific text label is printed and visible on a
+high-resolution map crop. Be strict: confirm visible=true ONLY if the
+literal text (or a near-typographic variant) is printed on the crop.
+Do NOT use geographic knowledge to infer that the place would be
+labelled there. Geographic plausibility is NOT visibility.
+
+Return STRICT JSON only."""
+
+PRESENCE_VERIFY_USER = """\
+Examine this map crop. Is the text "{claimed_text}" literally printed
+and clearly visible on this crop?
+
+Return STRICT JSON:
+
+{{
+  "visible": <true | false>,
+  "where_seen": "<short phrase describing where on the crop, or empty
+                  if not visible>"
+}}
+
+Hard rule: visible=true requires the literal word or phrase
+"{claimed_text}" (case- and spelling-tolerant for old typography) to
+be printed on this crop. If you would have to infer the answer from
+your knowledge of which countries / provinces border the region, the
+answer is visible=false."""
+
+
+# Field categories for v4. Some fields are best re-OCR'd (we just want
+# clearer text); some are best presence-verified (we want to throw out
+# values that aren't actually printed).
+_REREAD_FIELDS = {
+    # OCR-class — focused crop re-OCR helps
+    "title", "date_text", "date_year",
+    "publisher", "scale_text", "scale_ratio",
+    "projection", "edition", "coordinates_text",
+    "bbox_west", "bbox_east", "bbox_south", "bbox_north",
+    "legend_content", "notes",
+    "place_names",
+}
+_PRESENCE_VERIFY_FIELDS = {
+    # Geo-class — verify each comma-separated name is actually printed
+    "country", "province", "city", "district",
+}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Image helpers — all output as JPEG
 #   Crops:     JPG quality=100 (no compression) — max detail within API limit
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1195,6 +1295,35 @@ def _full_image_b64(img) -> tuple[str, str, int, int]:
         raw = len(base64.b64decode(b64))
 
     return b64, mt, work.size[0], work.size[1]
+
+
+def _crop_b64(img, bbox: list[float], max_dim: int = 1568) -> tuple[str, str, int, int]:
+    """Crop the bbox region from the FULL-res image and encode as JPEG b64.
+
+    Returns (b64, mime, encoded_w, encoded_h). Crop is at native resolution
+    so fine print stays legible — only downscaled if the crop itself is
+    bigger than max_dim (vision APIs cap around 1.5 MP internally anyway).
+    """
+    crop = _crop_region(img, bbox)
+    if crop.mode != "RGB":
+        crop = crop.convert("RGB")
+    cw, ch = crop.size
+    if max(cw, ch) > max_dim:
+        r = max_dim / max(cw, ch)
+        from PIL import Image
+        crop = crop.resize((int(cw * r), int(ch * r)), Image.LANCZOS)
+    b64, mt = _pil_to_b64_jpg(crop, quality=_THUMB_QUALITY)
+    # Enforce upload limit
+    raw = len(base64.b64decode(b64))
+    while raw > _MAX_IMAGE_BYTES and max(crop.size) > 256:
+        from PIL import Image
+        crop = crop.resize(
+            (int(crop.size[0] * 0.75), int(crop.size[1] * 0.75)),
+            Image.LANCZOS,
+        )
+        b64, mt = _pil_to_b64_jpg(crop, quality=_THUMB_QUALITY)
+        raw = len(base64.b64decode(b64))
+    return b64, mt, crop.size[0], crop.size[1]
 
 
 def _crop_region(img, bbox: list[float]):
@@ -1849,6 +1978,301 @@ def _apply_corrections(prev_fields: dict, prev_ts: dict,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# v4: Crop-and-reread + presence-verify passes
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Crop margin (in bbox-space %) — give the reread some surrounding context
+_REREAD_BBOX_MARGIN_PCT = 6.0
+
+
+def _expand_bbox_pct(bbox: list[float], margin: float) -> list[float]:
+    """Pad a bbox in percentage space, clamping to [0, 100]."""
+    x, y, w, h = bbox
+    nx = max(0.0, x - margin)
+    ny = max(0.0, y - margin)
+    nw = min(100.0 - nx, w + 2 * margin)
+    nh = min(100.0 - ny, h + 2 * margin)
+    return [nx, ny, nw, nh]
+
+
+async def _run_one_reread(
+    img_full,
+    field_key: str,
+    old_value,
+    bbox_pct: list[float],
+    what_critic_saw: str,
+    model: str,
+    api_key: str,
+    max_tokens: int,
+    context=None,
+    row_info=None,
+) -> tuple[dict | None, LLMUsage]:
+    """Crop the evidence_bbox at full resolution and re-OCR a single field."""
+    try:
+        expanded = _expand_bbox_pct(bbox_pct, _REREAD_BBOX_MARGIN_PCT)
+        b64, mime, cw, ch = _crop_b64(img_full, expanded)
+    except Exception as exc:
+        if context and row_info:
+            await context.emit("ai_debug", {
+                **row_info,
+                "phase": "error",
+                "error": f"Reread crop[{field_key}] failed: {exc}"[:500],
+            })
+        return None, LLMUsage()
+
+    ftype, ffmt = _rescue_field_hint(field_key)
+    user_text = _get_tmpl("REREAD_USER").format(
+        field_name=field_key,
+        field_type=ftype,
+        field_format=ffmt,
+        old_value=json.dumps(old_value, ensure_ascii=False, default=str),
+        what_critic_saw=(what_critic_saw or "").strip()[:300],
+    )
+    msg = _make_vision_message(user_text, b64, mime)
+
+    try:
+        resp = await _call_conversation_with_recitation_retry(
+            model, _get_tmpl("REREAD_SYSTEM"), [msg],
+            min(max_tokens, 4096), api_key, context, row_info,
+        )
+    except Exception as exc:
+        if context and row_info:
+            await context.emit("ai_debug", {
+                **row_info,
+                "phase": "error",
+                "error": f"Reread[{field_key}] call failed: {exc}"[:500],
+            })
+        return None, LLMUsage()
+
+    parsed = extract_json(resp.text) or {}
+    if not isinstance(parsed, dict):
+        return None, resp.usage
+    return {
+        "value":         parsed.get("value"),
+        "confident":     bool(parsed.get("confident", False)),
+        "verbatim_text": str(parsed.get("verbatim_text", "") or "")[:300],
+    }, resp.usage
+
+
+async def _run_one_presence_check(
+    img_full,
+    name: str,
+    bbox_pct: list[float],
+    model: str,
+    api_key: str,
+    max_tokens: int,
+    context=None,
+    row_info=None,
+) -> tuple[bool | None, LLMUsage]:
+    """Yes/no: is `name` literally printed inside this bbox crop?"""
+    try:
+        expanded = _expand_bbox_pct(bbox_pct, _REREAD_BBOX_MARGIN_PCT)
+        b64, mime, _, _ = _crop_b64(img_full, expanded)
+    except Exception:
+        return None, LLMUsage()
+
+    user_text = _get_tmpl("PRESENCE_VERIFY_USER").format(claimed_text=name)
+    msg = _make_vision_message(user_text, b64, mime)
+    try:
+        resp = await _call_conversation_with_recitation_retry(
+            model, _get_tmpl("PRESENCE_VERIFY_SYSTEM"), [msg],
+            min(max_tokens, 2048), api_key, context, row_info,
+        )
+    except Exception:
+        return None, LLMUsage()
+
+    parsed = extract_json(resp.text) or {}
+    if not isinstance(parsed, dict):
+        return None, resp.usage
+    visible = parsed.get("visible")
+    if not isinstance(visible, bool):
+        return None, resp.usage
+    return visible, resp.usage
+
+
+async def _run_reread_pass(
+    img_full,
+    fields: dict,
+    type_specific: dict,
+    last_verdicts: dict,
+    reread_model: str,
+    reread_api_key: str,
+    max_tokens: int,
+    context=None,
+    row_info=None,
+) -> tuple[dict, LLMUsage]:
+    """For each OCR-class field the critic flagged, crop + focused re-OCR.
+
+    Returns (replacements, total_usage) where replacements maps
+    field_key -> {value, verbatim_text} for confidently re-read fields.
+    """
+    out: dict[str, dict] = {}
+    total = LLMUsage()
+    if not reread_model or not reread_api_key:
+        return out, total
+
+    targets = []
+    for k, v in last_verdicts.items():
+        if v.get("ok"):
+            continue
+        if k.startswith("type_specific."):
+            continue
+        if k not in _REREAD_FIELDS:
+            continue
+        entry = fields.get(k)
+        if not entry:
+            continue
+        bbox = entry.get("evidence_bbox")
+        if not bbox:
+            continue
+        targets.append((k, entry.get("value"), bbox, v.get("what_you_see", "")))
+
+    if not targets:
+        return out, total
+
+    if context and row_info:
+        await context.emit("ai_debug", {
+            **row_info,
+            "phase": "reread_start",
+            "field_count": len(targets),
+            "fields": [k for k, *_ in targets],
+            "model": reread_model,
+        })
+
+    results = await asyncio.gather(*(
+        _run_one_reread(
+            img_full, k, old, bb, wys,
+            reread_model, reread_api_key, max_tokens,
+            context, row_info,
+        )
+        for k, old, bb, wys in targets
+    ), return_exceptions=False)
+
+    accepted = []
+    for (k, old, bb, wys), (rd, usage) in zip(targets, results):
+        total.input_tokens  += usage.input_tokens
+        total.output_tokens += usage.output_tokens
+        if not rd:
+            continue
+        if not rd.get("confident"):
+            continue
+        if rd.get("value") in (None, "", "null"):
+            continue
+        out[k] = rd
+        accepted.append(k)
+
+    if context and row_info:
+        await context.emit("ai_debug", {
+            **row_info,
+            "phase": "reread_result",
+            "accepted_count": len(accepted),
+            "accepted_fields": accepted,
+            "tokens": {
+                "input_tokens":  total.input_tokens,
+                "output_tokens": total.output_tokens,
+            },
+        })
+    return out, total
+
+
+async def _run_presence_check_pass(
+    img_full,
+    fields: dict,
+    last_verdicts: dict,        # kept for signature stability; unused
+    reread_model: str,
+    reread_api_key: str,
+    max_tokens: int,
+    context=None,
+    row_info=None,
+) -> tuple[dict, LLMUsage]:
+    """For every non-empty geo-class field (country/province/city/district),
+    split comma-separated place names and verify each is literally printed
+    on the field's evidence_bbox. Keep only verified names.
+
+    Runs UNCONDITIONALLY — independent of whether the critic flagged the
+    field. This is the only reliable defence against the "model fills
+    country list from geographic knowledge" hallucination, since
+    lenient critics often accept geographically-plausible names as
+    "directly visible" when they aren't.
+
+    Returns (cleaned_values, usage) where cleaned_values maps
+    field_key -> new (possibly shortened) value, or "" if no name verified.
+    """
+    out: dict[str, str] = {}
+    total = LLMUsage()
+    if not reread_model or not reread_api_key:
+        return out, total
+
+    targets = []
+    for k in _PRESENCE_VERIFY_FIELDS:
+        entry = fields.get(k)
+        if not entry:
+            continue
+        val = entry.get("value")
+        if not val or not str(val).strip():
+            continue
+        bbox = entry.get("evidence_bbox")
+        if not bbox:
+            continue
+        targets.append((k, str(val), bbox))
+
+    if not targets:
+        return out, total
+
+    if context and row_info:
+        await context.emit("ai_debug", {
+            **row_info,
+            "phase": "presence_check_start",
+            "field_count": len(targets),
+            "fields": [k for k, *_ in targets],
+        })
+
+    # For each field, spawn parallel checks for every comma-separated name
+    async def _process_field(field_key, value, bbox):
+        names = [n.strip() for n in str(value).split(",") if n.strip()]
+        if not names:
+            return field_key, "", LLMUsage()
+        checks = await asyncio.gather(*(
+            _run_one_presence_check(
+                img_full, n, bbox, reread_model, reread_api_key,
+                max_tokens, context, row_info,
+            )
+            for n in names
+        ), return_exceptions=False)
+        field_total = LLMUsage()
+        verified = []
+        for n, (vis, usage) in zip(names, checks):
+            field_total.input_tokens  += usage.input_tokens
+            field_total.output_tokens += usage.output_tokens
+            if vis is True:
+                verified.append(n)
+        return field_key, ", ".join(verified), field_total
+
+    results = await asyncio.gather(*(
+        _process_field(k, v, bb) for k, v, bb in targets
+    ), return_exceptions=False)
+
+    summary = []
+    for k, new_val, ft in results:
+        total.input_tokens  += ft.input_tokens
+        total.output_tokens += ft.output_tokens
+        out[k] = new_val
+        summary.append({"field": k, "kept": new_val})
+
+    if context and row_info:
+        await context.emit("ai_debug", {
+            **row_info,
+            "phase": "presence_check_result",
+            "summary": summary,
+            "tokens": {
+                "input_tokens":  total.input_tokens,
+                "output_tokens": total.output_tokens,
+            },
+        })
+    return out, total
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Node
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1897,6 +2321,26 @@ class AIMapAnalysisNode(BaseNode):
                                 "round adds two API calls per map. Set to 0 to run "
                                 "the critic for read-only flagging without "
                                 "feeding corrections back.",
+                ),
+                ConfigField(
+                    name="enable_reread",
+                    label="Reread + presence-check (v4)",
+                    type="boolean",
+                    default=True,
+                    description="For each critic-flagged field, crop the evidence "
+                                "bbox at full resolution and re-OCR (OCR fields) or "
+                                "verify each place name is literally printed (geo "
+                                "fields). Targets both OCR drift and "
+                                "training-knowledge leaks. ~$0.001 per flagged field.",
+                ),
+                ConfigField(
+                    name="reread_model",
+                    label="Reread / Presence-Check Model",
+                    type="select",
+                    default="",
+                    options=[],
+                    description="Vision model used for focused crop re-reads and "
+                                "binary presence checks. Defaults to the extractor.",
                 ),
                 ConfigField(
                     name="enable_rescue",
@@ -1996,6 +2440,25 @@ class AIMapAnalysisNode(BaseNode):
                     f"No API key for critic '{critic_model}'. Set it in Settings."
                 )
 
+        # v4 Reread model — focused crop re-OCR and presence-verify.
+        # Defaults to the EXTRACTOR (which is vision-capable) since the
+        # call needs to look at an image crop. Set "" to disable.
+        reread_model = (
+            (config.get("reread_model") or "").strip()
+            or model
+            or ""
+        ) if config.get("enable_reread", True) else ""
+        reread_api_key = ""
+        if reread_model and context:
+            try:
+                reread_provider_id = get_provider_id_for_model(reread_model)
+                reread_api_key = context.get_api_key(reread_provider_id)
+            except ValueError:
+                reread_model = ""
+            if reread_model and not reread_api_key:
+                # Don't hard-fail — v4 is a quality boost, not core.
+                reread_model = ""
+
         # Rescue model recovers demoted fields from the critic's own
         # observation. Defaults to the critic model since the call is
         # text-only and small. Set to "" to disable rescue.
@@ -2068,6 +2531,10 @@ class AIMapAnalysisNode(BaseNode):
             df["map_review_fields_demoted"] = ""
         if "map_review_fields_rescued" not in df.columns:
             df["map_review_fields_rescued"] = ""
+        if "map_review_fields_rereaded" not in df.columns:
+            df["map_review_fields_rereaded"] = ""
+        if "map_review_fields_presence_pruned" not in df.columns:
+            df["map_review_fields_presence_pruned"] = ""
         new_columns = [c for c in df.columns if c not in original_columns]
 
         total = len(df)
@@ -2282,6 +2749,78 @@ class AIMapAnalysisNode(BaseNode):
                                     "llm_output": cor_resp.text[:2500],
                                 })
 
+                    # ─── v4 Reread pass — for each OCR-flagged field, crop
+                    #     the evidence_bbox at full res and re-OCR just that
+                    #     field. Recovers OCR-class flags before they hit
+                    #     the demote step.
+                    rereaded_keys: set[str] = set()
+                    if (reread_model and reread_api_key
+                            and last_verdicts and (fields or type_specific)):
+                        rereads, rr_usage = await _run_reread_pass(
+                            img_full, fields, type_specific, last_verdicts,
+                            reread_model, reread_api_key,
+                            max_tokens, context, _row,
+                        )
+                        _token_total["input"]  += rr_usage.input_tokens
+                        _token_total["output"] += rr_usage.output_tokens
+                        for k, rd in rereads.items():
+                            entry = fields.get(k)
+                            if not entry:
+                                continue
+                            entry["value"] = rd["value"]
+                            entry["evidence_text"] = (
+                                f"reread crop: {rd.get('verbatim_text','')}"
+                            )[:400]
+                            rereaded_keys.add(k)
+                            # Mark verdict as ok so the downstream demote
+                            # loop doesn't drop this value.
+                            last_verdicts[k] = {"ok": True, "issue": "",
+                                                 "what_you_see": ""}
+
+                    # ─── v4 Presence-check pass — ALWAYS runs against every
+                    #     non-empty geo field (country/province/city/district)
+                    #     regardless of whether the critic flagged it.
+                    #     Many critics accept geographically-plausible name
+                    #     lists as "visible" even when the labels aren't on
+                    #     the scan; this pass is the only reliable defence.
+                    presence_pruned_keys: set[str] = set()
+                    if reread_model and reread_api_key and fields:
+                        cleaned, pv_usage = await _run_presence_check_pass(
+                            img_full, fields, last_verdicts,
+                            reread_model, reread_api_key,
+                            max_tokens, context, _row,
+                        )
+                        _token_total["input"]  += pv_usage.input_tokens
+                        _token_total["output"] += pv_usage.output_tokens
+                        for k, new_val in cleaned.items():
+                            entry = fields.get(k)
+                            if not entry:
+                                continue
+                            old_val = entry.get("value")
+                            if new_val:
+                                entry["value"] = new_val
+                                entry["evidence_text"] = (
+                                    f"presence-verified: {new_val}"
+                                )[:400]
+                                # Re-keep this field
+                                last_verdicts[k] = {"ok": True, "issue": "",
+                                                     "what_you_see": ""}
+                                if str(old_val).strip() != str(new_val).strip():
+                                    presence_pruned_keys.add(k)
+                            else:
+                                # No names verified — drop the field
+                                # outright. Independent of the critic's
+                                # verdict since presence-check runs
+                                # unconditionally.
+                                fields.pop(k, None)
+                                presence_pruned_keys.add(k)
+                                # If critic had previously flagged it, the
+                                # demote pass would have removed it anyway;
+                                # mark as ok to avoid double-counting in
+                                # the `demoted` set.
+                                last_verdicts[k] = {"ok": True, "issue": "",
+                                                     "what_you_see": ""}
+
                     # ─── Final pass: demote any field critic still rejects ──
                     demoted: set[str] = set()
                     if last_verdicts:
@@ -2344,7 +2883,8 @@ class AIMapAnalysisNode(BaseNode):
 
                     # Fields that were flagged at some point but survived
                     # — those are "uncertain" and worth manual review.
-                    uncertain: set[str] = ever_flagged - demoted - rescued_keys - {
+                    auto_fixed = rescued_keys | rereaded_keys | presence_pruned_keys
+                    uncertain: set[str] = ever_flagged - demoted - auto_fixed - {
                         k for k in ever_flagged
                         if (k.startswith("type_specific.")
                             and k[len("type_specific."):] not in type_specific)
@@ -2359,6 +2899,14 @@ class AIMapAnalysisNode(BaseNode):
                     if "map_review_fields_rescued" in df.columns:
                         df.at[idx, "map_review_fields_rescued"] = (
                             ", ".join(sorted(rescued_keys)) if rescued_keys else ""
+                        )
+                    if "map_review_fields_rereaded" in df.columns:
+                        df.at[idx, "map_review_fields_rereaded"] = (
+                            ", ".join(sorted(rereaded_keys)) if rereaded_keys else ""
+                        )
+                    if "map_review_fields_presence_pruned" in df.columns:
+                        df.at[idx, "map_review_fields_presence_pruned"] = (
+                            ", ".join(sorted(presence_pruned_keys)) if presence_pruned_keys else ""
                         )
 
                     # ─── Evidence preview image ─────────────────────────

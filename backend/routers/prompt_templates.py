@@ -107,6 +107,35 @@ TEMPLATE_META = {
         "placeholders": ["{field_name}", "{field_type}", "{field_format}",
                          "{what_you_see}", "{old_value}", "{issue}"],
     },
+    "REREAD_SYSTEM": {
+        "level": "Reread",
+        "role": "system",
+        "label": "Reread System — Focused OCR",
+        "description": "Vision specialist that re-OCRs one field from a high-res crop.",
+        "placeholders": [],
+    },
+    "REREAD_USER": {
+        "level": "Reread",
+        "role": "user",
+        "label": "Reread User — Single-Field Crop",
+        "description": "Sent with a crop of the field's evidence_bbox; asks for typed value.",
+        "placeholders": ["{field_name}", "{field_type}", "{field_format}",
+                         "{old_value}", "{what_critic_saw}"],
+    },
+    "PRESENCE_VERIFY_SYSTEM": {
+        "level": "PresenceVerify",
+        "role": "system",
+        "label": "Presence-Verify System — Binary Visibility Check",
+        "description": "Verifies a literal text label is printed on a crop. Strict against geographic inference.",
+        "placeholders": [],
+    },
+    "PRESENCE_VERIFY_USER": {
+        "level": "PresenceVerify",
+        "role": "user",
+        "label": "Presence-Verify User — Per-Name Check",
+        "description": "Yes/no per name. Used to prune country/province/city/district lists.",
+        "placeholders": ["{claimed_text}"],
+    },
 }
 
 
@@ -137,6 +166,8 @@ def _get_defaults() -> dict[str, str]:
         VISUAL_CRITIC_SYSTEM, VISUAL_CRITIC_USER,
         CORRECTION_USER,
         RESCUE_SYSTEM, RESCUE_USER,
+        REREAD_SYSTEM, REREAD_USER,
+        PRESENCE_VERIFY_SYSTEM, PRESENCE_VERIFY_USER,
     )
     return {
         "EXTRACT_SYSTEM": EXTRACT_SYSTEM,
@@ -150,6 +181,10 @@ def _get_defaults() -> dict[str, str]:
         "CORRECTION_USER": CORRECTION_USER,
         "RESCUE_SYSTEM": RESCUE_SYSTEM,
         "RESCUE_USER": RESCUE_USER,
+        "REREAD_SYSTEM": REREAD_SYSTEM,
+        "REREAD_USER": REREAD_USER,
+        "PRESENCE_VERIFY_SYSTEM": PRESENCE_VERIFY_SYSTEM,
+        "PRESENCE_VERIFY_USER": PRESENCE_VERIFY_USER,
     }
 
 

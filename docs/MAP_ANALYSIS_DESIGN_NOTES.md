@@ -387,15 +387,84 @@ Counts use "non-empty `map_*` cell, excluding `map_review_*` and
   Fewest data losses, lowest cost, audit columns surface anything
   ambiguous for human review.
 
-### 5-run cost & quality comparison
+### 5-run cost & quality comparison (run 4-8 + v4 additions)
 
-| Run | Extractor      | Critic                              | Fields | Uncert. | Demote | Tokens | Cost  | vs Run 4 |
-|----:|----------------|-------------------------------------|-------:|--------:|-------:|-------:|------:|---------:|
-| 4   | Qwen-VL-235B   | Claude Sonnet 4.5 (1 critic)        |  258   |   0     |   0    |  368k  | $0.61 | 100% |
-| 5   | Qwen-VL-235B   | Claude (3 specialists)              |  217   |   5     |   2    |  416k  | $0.88 | 145% |
-| 6   | Qwen-VL-235B   | Gemini 2.5 Flash Lite (specialists) |  242   |   1     |   0    |  463k  | $0.09 |  15% |
-| 7   | **Qwen-VL-32B**| Gemini 2.5 Flash Lite (specialists) |  245   |   4     |   3    |  457k  | $0.07 |  11% |
-| 8   | **Qwen-VL-32B**| Flash Lite (specialists) + rescue   |  256   |   4     |   0    |  477k  | $0.07 |  12% |
+| Run | Extractor      | Critic / extras                              | Fields | Uncert. | Demote | Tokens | Cost  | vs Run 4 |
+|----:|----------------|----------------------------------------------|-------:|--------:|-------:|-------:|------:|---------:|
+| 4   | Qwen-VL-235B   | Claude Sonnet 4.5 (1 critic)                 |  258   |   0     |   0    |  368k  | $0.61 | 100% |
+| 5   | Qwen-VL-235B   | Claude (3 specialists)                       |  217   |   5     |   2    |  416k  | $0.88 | 145% |
+| 6   | Qwen-VL-235B   | Gemini 2.5 Flash Lite (specialists)          |  242   |   1     |   0    |  463k  | $0.09 |  15% |
+| 7   | **Qwen-VL-32B**| Gemini 2.5 Flash Lite (specialists)          |  245   |   4     |   3    |  457k  | $0.07 |  11% |
+| 8   | **Qwen-VL-32B**| Flash Lite (specialists) + rescue            |  256   |   4     |   0    |  477k  | $0.07 |  12% |
+| 9   | Qwen-VL-32B    | Flash Lite + rescue + v4 (dormant)           |  250   |   4     |   0    |  391k  | $0.06 |   9% |
+| 10  | Qwen-VL-32B    | Flash Lite + rescue + v4 (no correction)     |  267   |   0     |   4    |  292k  | $0.04 |   7% |
+| 11  | Qwen-VL-32B    | Flash Lite + rescue + v4 (**presence always**) | 218 |   2     |   0    |  378k  | $0.05 |   9% |
+
+### Architectural shift — v4 (crop-and-reread + presence-verify)
+
+Trigger: a fresh-session Claude run on the same Arctic map exhibited the
+SAME bbox -180/+180/66.5/90 hallucination our pipeline did, even though
+it took a multi-step zoom-and-verify approach. We had deleted the
+multilevel L1→L3 pipeline in commit 30ea110 because it was too rigid;
+fresh Claude's adaptive crop-and-zoom showed the underlying idea was
+the right answer for OCR-class accuracy. We re-introduced it as a
+critic-driven action rather than a fixed pipeline stage.
+
+Two new passes added between specialist critic and final demote:
+
+1. **`_run_reread_pass`** — for every OCR-domain field the critic
+   flagged, crop the evidence_bbox at full resolution and ask a
+   focused single-field OCR call: "read the printed text in this crop
+   precisely." Confident replies become the new value. Targets the
+   "Port Moresby bbox tick can't be read at thumbnail resolution"
+   class of failure that single-pass grounding can't recover.
+2. **`_run_presence_check_pass`** — for every comma-separated name in
+   country/province/city/district, ask "is this literal text printed
+   anywhere on the evidence_bbox crop, yes or no?" Removes names that
+   can't be verified, regardless of whether the critic flagged the
+   field. Targets the "Arctic country list = USA/Canada/Russia from
+   geographic knowledge" hallucination that lenient critics let
+   through.
+
+Initial implementation (Run 9-10) gated presence-check on critic-flag.
+Run 11 changed it to **always-on** for the four geo fields. That alone
+took Arctic country from `Greenland, Norway, Russia, Canada, De...` →
+`Greenland` (the only label actually printed within the visible scan
+region of the partial-half Arctic map). All other test maps similarly
+had their country/province/city pruned to what the verifier could
+actually see — Ingrid's "Younghusband should not claim country=
+Australia just because the model knows where Younghusband Peninsula
+is" complaint is now structurally impossible.
+
+New audit columns surface the AI's automatic interventions:
+  - `map_review_fields_rereaded` — OCR fields recovered by crop reread
+  - `map_review_fields_presence_pruned` — geo fields with one or more
+                                          names removed by presence check
+  - (existing) `_uncertain`, `_demoted`, `_rescued`
+
+Cost: presence check uses ~$0.00005 per name × ~10 names per map ×
+4 geo fields = ~$0.002/map. Run 11 total $0.053 for 9 maps —
+projected $7 for the full 1225-map RGSSA collection. Cheaper than
+Run 8 because critic loop has less work to do when presence-check
+catches geo issues upstream.
+
+**Run 11 is the new production-fit recommendation.**
+
+| Class of issue                       | Run 4 baseline | Run 8 (no v4)   | Run 11 (v4) |
+|--------------------------------------|----------------|-----------------|-------------|
+| Arctic country leak                  | yes            | yes (partial)   | resolved    |
+| Younghusband country=Australia leak  | yes            | yes             | resolved    |
+| Port Moresby bbox tick OCR drift     | yes            | partial         | resolved (reread) |
+| Per-row review hint for human        | none           | uncertain only  | uncertain + pruned breadcrumbs |
+| Cost on 1225 maps                    | ~$83           | ~$10            | ~$7         |
+
+Open calibration question: presence-check on Arctic kept only
+"Greenland" but Ingrid's original review noted countries that may
+still be partially visible (Norway, Russia, Greenland, possibly
+Iceland). Need her review on whether Run 11 over-prunes on this case,
+or whether "Greenland only" is correct given the partial scan. If
+over-prune, raise the verifier's tolerance for old typography /
+abbreviated forms.
 
 ### Removed: Google free-tier concurrency cap
 Historical: the `concurrency` config defaulted to `min(4, len(df))` —
