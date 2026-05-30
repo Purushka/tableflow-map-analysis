@@ -19,12 +19,8 @@ interface PhasesMap {
 
 /** Phase badge colors */
 const PHASE_COLORS: Record<string, string> = {
-  L1: 'bg-sky-500/20 text-sky-400 border-sky-500/30',
-  L2a: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  L2b: 'bg-violet-500/20 text-violet-400 border-violet-500/30',
-  L3_coord: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
-  L3_sample: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
-  Synthesis: 'bg-pink-500/20 text-pink-400 border-pink-500/30',
+  extract: 'bg-sky-500/20 text-sky-400 border-sky-500/30',
+  critic: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
 };
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -295,7 +291,7 @@ export default function KnowledgeEditor() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           title: 'New Knowledge Entry',
-          phases: ['L2b'],
+          phases: ['extract'],
           category: '',
           content: '',
         }),

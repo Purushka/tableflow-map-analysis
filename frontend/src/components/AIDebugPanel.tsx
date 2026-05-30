@@ -344,46 +344,40 @@ export default function AIDebugPanel({ inline }: AIDebugPanelProps) {
 }
 
 function phaseColor(p: string): string {
-  if (p === 'error' || p === 'region_preview_error') return 'text-red-400';
+  if (p === 'error' || p === 'evidence_preview_error') return 'text-red-400';
   if (p === 'response' || p === 'done') return 'text-emerald-400';
-  if (p === 'L1_scan' || p === 'L1_result') return 'text-sky-400';
-  if (p === 'L2a_ocr' || p === 'L2a_result') return 'text-amber-400';
-  if (p === 'L2b_planning' || p === 'L2b_result') return 'text-violet-400';
-  if (p === 'L3_crop' || p === 'L3_result') return 'text-cyan-400';
-  if (p === 'synthesis') return 'text-pink-400';
-  if (p === 'region_preview') return 'text-green-400';
+  if (p === 'extract_start' || p === 'extract_result') return 'text-sky-400';
+  if (p === 'critic_start' || p === 'critic_review') return 'text-amber-400';
+  if (p === 'correction_sent' || p === 'correction_result') return 'text-violet-400';
+  if (p === 'evidence_preview' || p === 'region_preview') return 'text-green-400';
   if (p === 'debug_archive') return 'text-indigo-400';
   return 'text-[#94a3b8]';
 }
 
 function phaseBgColor(p: string): string {
-  if (p === 'error' || p === 'region_preview_error') return 'bg-red-500/15 text-red-400';
+  if (p === 'error' || p === 'evidence_preview_error') return 'bg-red-500/15 text-red-400';
   if (p === 'done') return 'bg-emerald-500/15 text-emerald-400';
-  if (p === 'L1_scan' || p === 'L1_result') return 'bg-sky-500/15 text-sky-400';
-  if (p === 'L2a_ocr' || p === 'L2a_result') return 'bg-amber-500/15 text-amber-400';
-  if (p === 'L2b_planning' || p === 'L2b_result') return 'bg-violet-500/15 text-violet-400';
-  if (p === 'L3_crop' || p === 'L3_result') return 'bg-cyan-500/15 text-cyan-400';
-  if (p === 'synthesis') return 'bg-pink-500/15 text-pink-400';
-  if (p === 'region_preview') return 'bg-green-500/15 text-green-400';
+  if (p === 'extract_start' || p === 'extract_result') return 'bg-sky-500/15 text-sky-400';
+  if (p === 'critic_start' || p === 'critic_review') return 'bg-amber-500/15 text-amber-400';
+  if (p === 'correction_sent' || p === 'correction_result') return 'bg-violet-500/15 text-violet-400';
+  if (p === 'evidence_preview' || p === 'region_preview') return 'bg-green-500/15 text-green-400';
   if (p === 'debug_archive') return 'bg-indigo-500/15 text-indigo-400';
   return 'bg-slate-500/15 text-[#94a3b8]';
 }
 
 function phaseLabel(p: string): string {
   const map: Record<string, string> = {
-    'L1_scan': 'L1',
-    'L1_result': 'L1',
-    'L2a_ocr': 'L2a',
-    'L2a_result': 'L2a',
-    'L2b_planning': 'L2b',
-    'L2b_result': 'L2b',
-    'L3_crop': 'L3',
-    'L3_result': 'L3',
-    'synthesis': 'Synth',
+    'extract_start': 'Extract',
+    'extract_result': 'Extract',
+    'critic_start': 'Critic',
+    'critic_review': 'Critic',
+    'correction_sent': 'Correct',
+    'correction_result': 'Correct',
+    'evidence_preview': 'Preview',
+    'evidence_preview_error': 'Error',
+    'region_preview': 'Preview',
     'done': 'Done',
     'error': 'Error',
-    'region_preview': 'Preview',
-    'region_preview_error': 'Error',
     'debug_archive': 'Archive',
   };
   return map[p] || p;

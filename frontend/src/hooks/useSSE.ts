@@ -47,14 +47,25 @@ function formatAiDebugText(phase: string, d: Record<string, any>): string {
       return `[SUPP CROP] ${d.filename || ''} → field="${d.field}" bbox=[${d.bbox}] crop=${d.crop_size || ''}`;
     case 'supplement_result':
       return `[SUPP RESULT] ${d.filename || ''} → field="${d.field}" value="${(d.value || '').slice(0, 100)}" confident=${d.confident}`;
+    case 'extract_start':
+      return `[EXTRACT START] ${d.filename || ''} (${d.full_size} → encoded ${d.encoded_size})`;
+    case 'extract_result':
+      return `[EXTRACT R${d.round ?? 0}] ${d.filename || ''}: ${d.fields_count || 0} grounded fields + ${d.type_specific_count || 0} ts — [${(d.field_names || []).slice(0, 10).join(', ')}]`;
     case 'critic_start':
       return `[CRITIC START] ${d.filename || ''} model=${d.critic_model || ''} claims=${d.claim_count || 0}`;
     case 'critic_review': {
-      const corr = d.corrections?.length || 0;
-      const warn = d.warnings?.length || 0;
+      const flagged = d.flagged_count ?? (d.flagged_fields?.length || 0);
       const tok = d.tokens ? ` tokens=${d.tokens.input_tokens || 0}in+${d.tokens.output_tokens || 0}out` : '';
-      return `[CRITIC REVIEW] ${d.filename || ''} corrections=${corr} warnings=${warn}${tok}`;
+      return `[CRITIC] ${d.filename || ''} flagged=${flagged}${tok}${flagged ? ` → [${(d.flagged_fields || []).join(', ')}]` : ''}`;
     }
+    case 'correction_sent':
+      return `[CORRECTION R${d.round ?? 0}] ${d.filename || ''}: sent ${(d.flagged_fields || []).length} flagged fields back to extractor`;
+    case 'correction_result':
+      return `[CORRECTION R${d.round ?? 0}] ${d.filename || ''}: extractor returned ${d.fields_count || 0} fields + ${d.type_specific_count || 0} ts`;
+    case 'evidence_preview':
+      return `[EVIDENCE] ${d.filename || ''}: ${d.num_regions || 0} bboxes visualized`;
+    case 'evidence_preview_error':
+      return `[EVIDENCE ERROR] ${d.error || ''}`;
     case 'critic_correction':
       return `[CRITIC FIX] ${d.filename || ''} field="${d.field}" demoted (was: "${(d.old_value || '').slice(0, 80)}") — ${d.note || ''}`;
     case 'done': {
@@ -92,14 +103,17 @@ function feedMapAnalysis(phase: string, d: Record<string, any>) {
   if (!fn) return;
 
   const MAP_PHASES = [
+    // Grounded extraction + critic loop
+    'extract_start', 'extract_result',
+    'critic_start', 'critic_review',
+    'correction_sent', 'correction_result',
+    'evidence_preview', 'done',
+    // Legacy phases — kept so old archived runs replay correctly
     'L1_scan', 'L1_result', 'L2a_ocr', 'L2a_result',
     'L2b_planning', 'L2b_result', 'L3_crop', 'L3_result',
-    'region_preview', 'synthesis', 'done',
-    // Direct mode phases
+    'region_preview', 'synthesis',
     'direct_main', 'direct_result', 'supplement_crop', 'supplement_result',
-    // Critic phases
-    'critic_start', 'critic_review', 'critic_correction',
-    // Post-process phases
+    'critic_correction',
     'post_process_start', 'post_process_refined', 'post_process_done',
   ];
   if (!MAP_PHASES.includes(phase)) return;
@@ -139,10 +153,10 @@ function feedMapAnalysis(phase: string, d: Record<string, any>) {
     phase,
   });
 
-  if (phase === 'L1_scan' || phase === 'direct_main') {
+  if (phase === 'extract_start' || phase === 'L1_scan' || phase === 'direct_main') {
     mapStore.updateMap(fn, { sourceImage: d.source_image });
     mapStore.openPanel(fn);
-  } else if (phase === 'region_preview') {
+  } else if (phase === 'evidence_preview' || phase === 'region_preview') {
     mapStore.updateMap(fn, { previewPath: d.preview_path });
     const regions = d.regions as Array<{ label: string; type: string; bbox: number[] }>;
     if (regions) {
@@ -213,9 +227,20 @@ function feedMapAnalysis(phase: string, d: Record<string, any>) {
       });
     }
   } else if (phase === 'critic_review') {
-    const audit = d.audit as Record<string, { evidence: string; note: string }> | undefined;
-    if (audit) {
-      mapStore.updateMap(fn, { criticAudit: audit });
+    // New grounding-critic verdicts shape: {ok, issue, what_you_see}
+    const verdicts = d.verdicts as Record<string, { ok: boolean; issue: string; what_you_see: string }> | undefined;
+    if (verdicts) {
+      const auditCompat: Record<string, { evidence: string; note: string }> = {};
+      for (const [k, v] of Object.entries(verdicts)) {
+        auditCompat[k] = {
+          evidence: v.ok ? 'directly_visible' : 'inferred_questionable',
+          note: v.ok ? '' : `${v.issue || ''}${v.what_you_see ? ` — sees: ${v.what_you_see}` : ''}`,
+        };
+      }
+      mapStore.updateMap(fn, { criticAudit: auditCompat });
+    } else if (d.audit) {
+      // Legacy audit shape
+      mapStore.updateMap(fn, { criticAudit: d.audit });
     }
   } else if (phase === 'critic_correction') {
     const field = d.field as string | undefined;

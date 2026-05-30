@@ -620,6 +620,15 @@ function MapListSidebar({
 
 // ── Phase Timeline ────────────────────────────────────────────────────────────
 
+const GROUNDED_PHASE_GROUPS = [
+  { key: 'extract', label: 'Extract', phases: ['extract_start', 'extract_result'] },
+  { key: 'critic', label: 'Critic', phases: ['critic_start', 'critic_review'] },
+  { key: 'correct', label: 'Correct', phases: ['correction_sent', 'correction_result'] },
+  { key: 'evidence', label: 'Evidence', phases: ['evidence_preview'] },
+  { key: 'done', label: 'Done', phases: ['done'] },
+];
+
+// Legacy groups kept so old archived runs replay correctly
 const MULTILEVEL_PHASE_GROUPS = [
   { key: 'L1', label: 'L1', phases: ['L1_scan', 'L1_result'] },
   { key: 'L2a', label: 'L2a', phases: ['L2a_ocr', 'L2a_result'] },
@@ -639,10 +648,15 @@ function PhaseTimeline({ entry }: { entry: MapEntry }) {
   const reached = new Set(entry.phaseHistory.map((p) => p.phase));
   const currentPhase = entry.phase;
 
-  // Auto-detect mode: if we see direct_result phase, use direct groups
-  const isDirectMode = reached.has('direct_result') ||
-    entry.phaseHistory.some((p) => p.phase === 'direct_result');
-  const PHASE_GROUPS = isDirectMode ? DIRECT_PHASE_GROUPS : MULTILEVEL_PHASE_GROUPS;
+  // Auto-detect pipeline shape based on which phases have actually fired.
+  const isGrounded = reached.has('extract_start') || reached.has('extract_result')
+    || reached.has('critic_review') || reached.has('evidence_preview');
+  const isDirect = !isGrounded && (reached.has('direct_result') || reached.has('direct_main'));
+  const PHASE_GROUPS = isGrounded
+    ? GROUNDED_PHASE_GROUPS
+    : isDirect
+      ? DIRECT_PHASE_GROUPS
+      : MULTILEVEL_PHASE_GROUPS;
 
   function groupElapsed(group: (typeof PHASE_GROUPS)[number]): string | null {
     const records = entry.phaseHistory.filter((r) => group.phases.includes(r.phase));

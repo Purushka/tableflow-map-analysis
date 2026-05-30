@@ -2,8 +2,8 @@ import type { Template } from './index';
 
 export const AI_MAP_ANALYSIS_TEMPLATE: Template = {
   id: 'ai_map_analysis',
-  name: 'AI Map Analysis (3-Level)',
-  description: 'Load map scans → 3-level AI analysis (scan → read text → explore map body) → standardized catalogue fields → Excel',
+  name: 'AI Map Analysis (Grounded + Critic)',
+  description: 'Load map scans → grounded single-pass extraction (every field bound to a bbox) → critic-loop verification → standardized catalogue fields → Excel',
   category: 'ai',
   nodes: [
     {
@@ -17,10 +17,11 @@ export const AI_MAP_ANALYSIS_TEMPLATE: Template = {
       data: {
         label: 'AI Map Analysis',
         config: {
-          mode: 'multilevel',
           model: '',
+          critic_model: '',
+          max_correction_rounds: 2,
           image_column: 'file_path',
-          max_tokens: 50000,
+          max_tokens: 16000,
           concurrency: 0,
         },
       },

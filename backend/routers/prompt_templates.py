@@ -1,8 +1,14 @@
 """
 Prompt template management API.
 
-Allows reading, editing, and resetting the AI prompt templates
-used by the map analysis pipeline, without touching code.
+Allows reading, editing, and resetting the AI prompt templates used by
+the map analysis pipeline, without touching code.
+
+The current pipeline uses three templates:
+  EXTRACT_SYSTEM / EXTRACT_USER  — grounded extractor (single pass)
+  CRITIC_SYSTEM / CRITIC_USER    — independent grounding verifier
+  CORRECTION_USER                — fed back to the extractor's session
+                                   when the critic flags something
 """
 
 import os
@@ -13,7 +19,6 @@ from typing import Optional
 
 router = APIRouter(prefix="/api/prompt-templates", tags=["prompt-templates"])
 
-# Path to the user-customized templates file
 _TEMPLATE_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "storage")
 )
@@ -22,132 +27,40 @@ _TEMPLATE_FILE = os.path.join(_TEMPLATE_DIR, "prompt_templates.json")
 # ── All template keys and their meta ────────────────────────────────────────
 
 TEMPLATE_META = {
-    "L1_SYSTEM": {
-        "level": "L1",
+    "EXTRACT_SYSTEM": {
+        "level": "Extract",
         "role": "system",
-        "label": "L1 System — Thumbnail Scan",
-        "description": "System instructions for the initial thumbnail scan that identifies text regions.",
+        "label": "Extractor System — Grounded Extraction",
+        "description": "System instructions for the single-pass grounded extractor.",
         "placeholders": [],
     },
-    "L1_USER": {
-        "level": "L1",
+    "EXTRACT_USER": {
+        "level": "Extract",
         "role": "user",
-        "label": "L1 User — Thumbnail Analysis",
-        "description": "User prompt for thumbnail scan. The AI identifies text regions and gets an overview.",
+        "label": "Extractor User — Grounded Fields",
+        "description": "User prompt that tells the extractor what fields to ground and how.",
         "placeholders": ["{filename}"],
     },
-    "L2A_SYSTEM": {
-        "level": "L2a",
+    "CRITIC_SYSTEM": {
+        "level": "Critic",
         "role": "system",
-        "label": "L2a System — High-Res OCR",
-        "description": "System instructions for precision OCR on text region crops.",
+        "label": "Critic System — Grounding Verifier",
+        "description": "System instructions for the independent grounding verifier.",
         "placeholders": [],
     },
-    "L2A_USER": {
-        "level": "L2a",
+    "CRITIC_USER": {
+        "level": "Critic",
         "role": "user",
-        "label": "L2a User — Text OCR",
-        "description": "User prompt for reading text from high-res crops.",
-        "placeholders": ["{label}", "{hint}", "{context}"],
+        "label": "Critic User — Per-Field Verdicts",
+        "description": "User prompt for the critic to verify each grounded claim.",
+        "placeholders": ["{filename}", "{claims_json}"],
     },
-    "L2B_SYSTEM": {
-        "level": "L2b",
-        "role": "system",
-        "label": "L2b System — Region Planning",
-        "description": "System instructions for planning which map regions to examine next.",
-        "placeholders": [],
-    },
-    "L2B_USER": {
-        "level": "L2b",
+    "CORRECTION_USER": {
+        "level": "Correction",
         "role": "user",
-        "label": "L2b User — Smart Planning",
-        "description": "User prompt for planning coordinate strips and map samples to examine.",
-        "placeholders": ["{filename}", "{overview_json}", "{ocr_json}"],
-    },
-    "L3_SYSTEM_COORDINATE": {
-        "level": "L3",
-        "role": "system",
-        "label": "L3 System — Coordinate Extraction",
-        "description": "System instructions for extracting coordinates from map edge strips.",
-        "placeholders": [],
-    },
-    "L3_USER_COORDINATE": {
-        "level": "L3",
-        "role": "user",
-        "label": "L3 User — Coordinate Strip",
-        "description": "User prompt for reading longitude/latitude/scale from edge strips.",
-        "placeholders": ["{label}", "{position}", "{expected_type}", "{hint}", "{context}", "{other_regions}"],
-    },
-    "L3_SYSTEM_SAMPLE": {
-        "level": "L3",
-        "role": "system",
-        "label": "L3 System — Map Body Analysis",
-        "description": "System instructions for analyzing map body content.",
-        "placeholders": [],
-    },
-    "L3_USER_SAMPLE": {
-        "level": "L3",
-        "role": "user",
-        "label": "L3 User — Map Body Sample",
-        "description": "User prompt for extracting place names, terrain, infrastructure from map sections.",
-        "placeholders": ["{label}", "{position}", "{hint}", "{context}", "{other_regions}"],
-    },
-    "SYNTH_SYSTEM": {
-        "level": "Synthesis",
-        "role": "system",
-        "label": "Synthesis System — Metadata Merge",
-        "description": "System instructions for combining all analysis data into final metadata.",
-        "placeholders": [],
-    },
-    "SYNTH_USER": {
-        "level": "Synthesis",
-        "role": "user",
-        "label": "Synthesis User — Final Metadata",
-        "description": "User prompt for merging all levels into 21 structured catalogue fields.",
-        "placeholders": ["{overview_json}", "{text_json}", "{understanding_json}", "{coordinate_json}", "{sample_json}"],
-    },
-    "POST_PROCESS_SYSTEM": {
-        "level": "Post",
-        "role": "system",
-        "label": "Post-Process System — QA Review",
-        "description": "System instructions for cross-map quality assurance review.",
-        "placeholders": [],
-    },
-    "POST_PROCESS_USER": {
-        "level": "Post",
-        "role": "user",
-        "label": "Post-Process User — Batch Refinement",
-        "description": "User prompt for refining a batch of maps with cross-map context.",
-        "placeholders": ["{count}", "{cross_map_summary}", "{map_data_json}"],
-    },
-    # ── Direct mode prompts ──
-    "DIRECT_SYSTEM": {
-        "level": "Direct",
-        "role": "system",
-        "label": "Direct System — Single-Pass Extraction",
-        "description": "System instructions for the direct single-pass high-res analysis mode.",
-        "placeholders": [],
-    },
-    "DIRECT_USER": {
-        "level": "Direct",
-        "role": "user",
-        "label": "Direct User — Full Metadata Extraction",
-        "description": "User prompt for extracting all map metadata in one pass from a high-res image.",
-        "placeholders": ["{filename}"],
-    },
-    "DIRECT_SUPPLEMENT_SYSTEM": {
-        "level": "Direct",
-        "role": "system",
-        "label": "Direct Supplement System — Detail Crop",
-        "description": "System instructions for re-examining unclear areas at higher resolution.",
-        "placeholders": [],
-    },
-    "DIRECT_SUPPLEMENT_USER": {
-        "level": "Direct",
-        "role": "user",
-        "label": "Direct Supplement User — Targeted Read",
-        "description": "User prompt for reading specific details from a cropped region.",
-        "placeholders": ["{filename}", "{label}", "{field}", "{reason}", "{context}"],
+        "label": "Correction User — Critic Feedback",
+        "description": "Fed back into the extractor's session when the critic flags fields.",
+        "placeholders": ["{verdicts_summary}"],
     },
 }
 
@@ -173,35 +86,16 @@ def _save_custom_templates(templates: dict[str, str]):
 def _get_defaults() -> dict[str, str]:
     """Import and return default prompt constants from ai_map_analysis."""
     from ..nodes.ai_map_analysis import (
-        L1_SYSTEM, L1_USER,
-        L2A_SYSTEM, L2A_USER,
-        L2B_SYSTEM, L2B_USER,
-        L3_SYSTEM_COORDINATE, L3_USER_COORDINATE,
-        L3_SYSTEM_SAMPLE, L3_USER_SAMPLE,
-        SYNTH_SYSTEM, SYNTH_USER,
-        POST_PROCESS_SYSTEM, POST_PROCESS_USER,
-        DIRECT_SYSTEM, DIRECT_USER,
-        DIRECT_SUPPLEMENT_SYSTEM, DIRECT_SUPPLEMENT_USER,
+        EXTRACT_SYSTEM, EXTRACT_USER,
+        CRITIC_SYSTEM, CRITIC_USER,
+        CORRECTION_USER,
     )
     return {
-        "L1_SYSTEM": L1_SYSTEM,
-        "L1_USER": L1_USER,
-        "L2A_SYSTEM": L2A_SYSTEM,
-        "L2A_USER": L2A_USER,
-        "L2B_SYSTEM": L2B_SYSTEM,
-        "L2B_USER": L2B_USER,
-        "L3_SYSTEM_COORDINATE": L3_SYSTEM_COORDINATE,
-        "L3_USER_COORDINATE": L3_USER_COORDINATE,
-        "L3_SYSTEM_SAMPLE": L3_SYSTEM_SAMPLE,
-        "L3_USER_SAMPLE": L3_USER_SAMPLE,
-        "SYNTH_SYSTEM": SYNTH_SYSTEM,
-        "SYNTH_USER": SYNTH_USER,
-        "POST_PROCESS_SYSTEM": POST_PROCESS_SYSTEM,
-        "POST_PROCESS_USER": POST_PROCESS_USER,
-        "DIRECT_SYSTEM": DIRECT_SYSTEM,
-        "DIRECT_USER": DIRECT_USER,
-        "DIRECT_SUPPLEMENT_SYSTEM": DIRECT_SUPPLEMENT_SYSTEM,
-        "DIRECT_SUPPLEMENT_USER": DIRECT_SUPPLEMENT_USER,
+        "EXTRACT_SYSTEM": EXTRACT_SYSTEM,
+        "EXTRACT_USER": EXTRACT_USER,
+        "CRITIC_SYSTEM": CRITIC_SYSTEM,
+        "CRITIC_USER": CRITIC_USER,
+        "CORRECTION_USER": CORRECTION_USER,
     }
 
 

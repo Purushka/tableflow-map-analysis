@@ -27,12 +27,8 @@ _KB_FILE = os.path.join(_STORAGE_DIR, "map_knowledge.json")
 
 # ── Analysis phases that can use knowledge ─────────────────────────────────
 PHASES = {
-    "L1":        "L1 — Thumbnail Scan (identify text regions, map type)",
-    "L2a":       "L2a — High-Res OCR (read text from crops)",
-    "L2b":       "L2b — Region Planning (identify coordinate strips, map samples)",
-    "L3_coord":  "L3 — Coordinate Extraction (read lat/lon/scale from strips)",
-    "L3_sample": "L3 — Map Body Analysis (place names, features, terrain)",
-    "Synthesis":  "Synthesis — Combine all data into structured metadata",
+    "extract": "Extract — Grounded single-pass metadata extraction",
+    "critic":  "Critic — Independent grounding verifier",
 }
 
 # ── Default knowledge entries (empty — users add their own) ────────────────
@@ -70,7 +66,7 @@ def get_knowledge_for_phase(phase: str) -> str:
     Returns formatted text ready to inject into a prompt.
     Called by ai_map_analysis at runtime.
 
-    Phase names: L1, L2a, L2b, L3_coord, L3_sample, Synthesis
+    Phase names: extract, critic
     """
     entries = _load_entries()
     relevant = [e for e in entries if phase in e.get("phases", [])]

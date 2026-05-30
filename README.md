@@ -6,17 +6,33 @@ A no-code data pipeline system built with FastAPI + React. The headline feature 
 
 TableFlow is a visual pipeline editor (think n8n / Node-RED, but for tables) where each node reads, transforms, or enriches a dataset. Nodes can be plain ETL (filter, join, pivot, deduplicate) or LLM-powered (classify, enrich, vision, search, map-analysis).
 
-The **Map Analysis** node is the centerpiece. Given a folder of map images, it runs each image through a four-stage vision conversation and emits one structured row per map:
+The **Map Analysis** node is the centerpiece. Given a folder of map images, it runs each image through a grounded extractor + critic loop and emits one structured row per map:
 
 ```
-L1  thumbnail scan          → overview + text regions
-L2a parallel OCR            → text content per region
-L2b planning                → decide which map regions to crop and inspect
-L3  parallel region explore → border + sample reads with positional context
-Synthesis                   → 25-column structured JSON (country / province / city / district / …)
+Extract  full image → grounded fields ({value, evidence_bbox, evidence_text, evidence_kind})
+   ↓
+Critic   reviews each field against its evidence_bbox in the same image
+   ↓
+Correct  if critic flags anything, the feedback is appended to the extractor's
+         conversation and the extractor re-grounds the flagged fields
+   ↓
+(loop up to max_correction_rounds; fields the critic still rejects are dropped)
 ```
 
-L1 → L2b → Synthesis share a single conversation per map, so each step sees the model's earlier reasoning. L2a OCR and L3 region exploration are fanned out in parallel for throughput.
+Every non-empty field the extractor outputs must be bound to a specific
+rectangular region of the image (`evidence_bbox`) and accompanied by the
+source text or visual marker that supports it. If the extractor cannot point
+to where a value is visible, it must omit the field entirely — so the
+dataframe never gets values pulled from the model's training memory of
+"famous maps that usually show X".
+
+The critic is a second vision model that looks at each `evidence_bbox`
+and judges whether the claim is actually supported. Flagged fields are
+fed back into the **same extractor conversation** as a follow-up user
+message, so the extractor has its prior reasoning plus the critic's
+feedback when it re-extracts. After the final round, any field the critic
+still flags is demoted to empty — better a missing column than a
+hallucinated one.
 
 ## Stack
 
