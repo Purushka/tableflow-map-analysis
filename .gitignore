@@ -48,3 +48,9 @@ SESSION_HANDOFF.md
 test_match_review.py
 NUL
 tmp_run/
+
+# Abandoned pywebview prototype (contains hardcoded API keys)
+desktop_app/
+
+# Local spreadsheet artefacts
+map_analysis.xlsx

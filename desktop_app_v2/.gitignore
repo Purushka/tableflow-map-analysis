@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.pyc
+
+# Local secrets / runtime state (these live in %APPDATA% normally, but never commit any stray copy)
+config.json
+*.key
+review_state.json
+per_map_cache/
+
+# Signing — local account config (keep the .example, ignore the real one)
+signing.config.bat
+*.pfx
+*.snk
+
+# Temp / logs
+*.log
+err.txt
